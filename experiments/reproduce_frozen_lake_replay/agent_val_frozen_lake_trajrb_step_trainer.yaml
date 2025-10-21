@@ -188,14 +188,22 @@ custom_envs:
       is_slippery: false
 
 # =============================================================================
-# OLD LOG PROB SETTINGS (step + trainer)
+# OFF-POLICY MONITORING CONFIGURATION
 # =============================================================================
+# Independent of replay buffer - can monitor fresh batches, replay batches, or both
 
-# 作用域：对"本轮生成"的 response 计算 old log prob
-old_prob_mode: turn           # trajectory | turn
+offpolicy_monitor:
+  enabled: true  # Enable off-policy monitoring
 
-# 计算路径：训练侧重算，确保一致与准确
-old_prob_compute: trainer     # engine | trainer
+  # Behavior policy log probs computation
+  save_behavior_log_probs: true  # Compute and save after rollout
+  behavior_compute: trainer  # trainer (recompute, accurate) | engine (use inference logprobs, faster)
+  behavior_scope: turn  # turn (last assistant turn) | trajectory (full response)
+
+  # Monitoring targets
+  monitor_fresh_batch: true  # Monitor fresh rollout batches
+  monitor_replay_batch: true  # Monitor replay buffer batches
+  monitor_interval: 1  # Monitor every N steps
 
 # =============================================================================
 # TRAJECTORY REPLAY BUFFER CONFIGURATION
@@ -203,15 +211,13 @@ old_prob_compute: trainer     # engine | trainer
 
 replay:
   enabled: true
-  capacity: 100000  # Reduced from 100000 to avoid OOM (original numpy-based buffer is memory efficient)
-  distributed: false  # Use original numpy-based buffer (memory efficient, ~8KB/trajectory)
-  use_tensordict: false  # Use original implementation, not TensorDict version
-  min_size: ${rollout_batch_size}
-  train_steps_per_env_step: 1
-  use_rollout_batch_size: true
-  sampling_mode: "trajectory"     # 轨迹级 buffer（由 TrajEnvManager 自动选择）
-  sample_method: lifo
-  storage_mode: tokens_only
-  lazy_tokenization: false
+  capacity: 100000  # Max trajectories in buffer
+  min_size: ${rollout_batch_size}  # Start sampling when buffer has this many samples
+  train_steps_per_env_step: 1  # Additional training steps per rollout step
+  use_rollout_batch_size: true  # Use rollout_batch_size for replay sampling
+  sampling_mode: "trajectory"  # trajectory (full episodes) | step (per-step sampling)
+  sample_method: lifo  # lifo (newest) | fifo (oldest) | uniform (random)
+  storage_mode: tokens_only  # tokens_only | text_only | hybrid
+  lazy_tokenization: false  # Tokenize during storage (false) or sampling (true)
 
 
