@@ -1,0 +1,255 @@
+# ==============================================================================
+# NQ SEARCH TRAINING - Trajectory Replay Buffer + old_prob(turn + trainer)
+# ==============================================================================
+defaults:
+  - ../../ROLL/examples/config/traj_envs@_here_
+  - ../../ROLL/examples/config/deepspeed_zero@_here_
+  - ../../ROLL/examples/config/deepspeed_zero2@_here_
+  - ../../ROLL/examples/config/deepspeed_zero3@_here_
+  - ../../ROLL/examples/config/deepspeed_zero3_cpuoffload@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "nq_search_agentic"
+seed: 42
+timestamp: ${oc.env:TRAINING_TIMESTAMP,${now:%Y%m%d_%H%M%S}}
+base_output_dir: /data1/Chengyang_project/roll_dev/experiments/nq_search_replay/output
+logging_dir: ${base_output_dir}/${timestamp}/logs
+output_dir: ${base_output_dir}/${timestamp}
+render_save_dir: ${base_output_dir}/${timestamp}/render
+system_envs:
+  USE_MODELSCOPE: '1'
+
+track_with: wandb
+tracker_kwargs:
+  project: roll-agentic-nq-search
+  name: ${timestamp}_${exp_name}_trajrb_turn_trainer
+  notes: "NQ Search with Trajectory ReplayBuffer + old_prob(turn+trainer)"
+  tags: [agentic, roll, nq_search, replay, traj_rb, retrieval_qa]
+  mode: offline
+  dir: ${base_output_dir}/${timestamp}/wandb
+
+checkpoint_config:
+  type: file_system
+  output_dir: ${base_output_dir}/${timestamp}/models/${exp_name}
+
+# =============================================================================
+# TRAINING CONFIGURATION
+# =============================================================================
+
+num_gpus_per_node: 8
+
+max_steps: 100
+save_steps: 10000
+logging_steps: 1
+eval_steps: 5
+resume_from_checkpoint: false
+
+train_from_replay_only: false
+batch_adjust_mode: auto
+async_generation_ratio: 1
+
+# Batch and sequence settings
+rollout_batch_size: 128  # 1.5B 模型可以支持更大的 batch size
+val_batch_size: 128      
+sequence_length: 8192
+
+# RL algorithm settings
+advantage_clip: 0.2
+ppo_epochs: 1
+adv_estimator: "reinforce"
+init_kl_coef: 0.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+# =============================================================================
+# MODEL CONFIGURATION
+# =============================================================================
+
+pretrain: /data1/models/pretrain/Qwen2.5-1.5B-Instruct
+reward_pretrain: /data1/models/pretrain/Qwen2.5-1.5B-Instruct
+
+actor_train:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 32  # rollout_batch_size(128) / per_device_train_batch_size(1) / 4 GPUs
+    warmup_steps: 10
+    lr_scheduler_type: cosine
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: megatron_train
+    strategy_config:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 1
+      use_distributed_optimizer: true
+      recompute_granularity: full
+  device_mapping: list(range(0,4))
+  infer_batch_size: 2
+
+actor_infer:
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: 512  # 恢复原值，1.5B 模型可以支持
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.99
+    num_return_sequences: 1
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.4  # 进一步降低以为 reference 模型留空间 (原: 0.8  -> 0.4)
+      block_size: 16
+      load_format: auto
+  device_mapping: list(range(4,8))
+
+reference:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: hf_infer
+    strategy_config: ~
+  device_mapping: list(range(0,4))
+  infer_batch_size: 1  # 降低以减少内存峰值（原: 2）
+
+# =============================================================================
+# ENVIRONMENT CONFIGURATION
+# =============================================================================
+
+# NQ Search 使用 <think>, <search>, <answer> 三个标签
+action_pattern: (<think>.*?</think>.*?(<search>.*?</search>|<answer>.*?</answer>))
+think_action_pattern: <think>(.*?)</think>\s*(?:<search>(.*?)</search>|<answer>(.*?)</answer>)
+user_prompt_format: |
+  <think> [Your reasoning] </think> 
+  <search> [search query] </search> (if you need more information)
+  OR
+  <answer> [your final answer] </answer> (if you are ready to answer)
+
+max_tokens_per_step: 512  # 恢复原值，1.5B 模型可以支持
+max_actions_per_traj: 5
+
+reward_normalization:
+  grouping: traj_group_id
+  method: mean_std
+
+train_env_manager:
+  format_penalty: -0.15
+  max_env_num_per_worker: 16  # 恢复原值，1.5B 模型显存充足
+  num_env_groups: 128         # 恢复原值，提升并发
+  group_size: 8               # 恢复原值
+  tags: [NQSearch]
+  num_groups_partition: [128] # 必须等于 num_env_groups
+
+val_env_manager:
+  max_env_num_per_worker: 32  # 恢复原值
+  num_env_groups: 512         # 适当提升（原 FrozenLake 是 1024，我们用一半）
+  group_size: 1
+  tags: [NQSearch]
+  num_groups_partition: [512] # 必须等于 num_env_groups
+
+custom_envs:
+  NQSearch:
+    env_type: nq_search
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_format}
+    agent_system_template: "You are a helpful AI assistant that can search for information and answer questions."
+    agent_template: |
+      Current turn: {turn_idx}
+      Previous actions: {actions_left}
+      
+      Please analyze the question and decide whether you need to search for more information or provide the final answer.
+      Use <think> to explain your reasoning, <search> to search for information, or <answer> to provide your final answer.
+      
+      You must respond within {max_response_length} tokens.
+    reward_template: "Feedback: Your previous action received reward {reward}. Continue or adjust your strategy."
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    env_config:
+      # 数据集配置
+      dataset_path: /data1/Agentic_LLM-search/datasets/nq_search_converted/train_searchenv.parquet
+      max_instances: 1000
+      
+      # 检索服务器配置
+      retrieval_server_url: http://127.0.0.1:8100/retrieve
+      retrieval_timeout: 30
+      retrieval_topk: 3
+      return_scores: true
+      
+      # 限流配置
+      max_concurrent_calls: 5
+      limiter_tag: nq_search_env
+      disable_limiter: false
+      
+      # 环境设置
+      max_steps: ${max_actions_per_traj}
+      max_search_calls: 5
+      
+      # 动作解析模式
+      think_pattern: <think>(.*?)</think>
+      search_pattern: <search>(.*?)</search>
+      answer_pattern: <answer>(.*?)</answer>
+      
+      # 奖励设置
+      use_outcome_reward_only: true
+      correct_answer_reward: 1.0
+      step_penalty: 0.0
+      invalid_action_penalty: 0.0
+      
+      # EM评估配置
+      use_em_evaluation: true
+      em_ignore_case: true
+      em_ignore_punctuation: true
+      em_ignore_articles: true
+      
+      # 特殊标记
+      special_token_list: ["<think>", "</think>", "<search>", "</search>", "<answer>", "</answer>", "<information>", "</information>"]
+
+# =============================================================================
+# OLD LOG PROB SETTINGS (turn + trainer)
+# =============================================================================
+
+# 作用域：对"本轮生成"的 response 计算 old log prob
+old_prob_mode: turn           # trajectory | turn
+
+# 计算路径：训练侧重算，确保一致与准确
+old_prob_compute: trainer     # engine | trainer
+
+# =============================================================================
+# TRAJECTORY REPLAY BUFFER CONFIGURATION
+# =============================================================================
+
+replay:
+  enabled: true
+  capacity: 50000
+  distributed: false
+  use_tensordict: false
+  min_size: ${rollout_batch_size}
+  train_steps_per_env_step: 1
+  use_rollout_batch_size: true
+  sampling_mode: "trajectory"
+  sample_method: lifo
+  storage_mode: tokens_only
+  lazy_tokenization: false
+

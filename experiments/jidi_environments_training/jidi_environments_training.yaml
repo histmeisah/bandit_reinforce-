@@ -1,0 +1,272 @@
+defaults:
+  - ../../ROLL/examples/config/envs@_here_
+  - ../../ROLL/examples/config/deepspeed_zero@_here_
+  - ../../ROLL/examples/config/deepspeed_zero2@_here_
+  - ../../ROLL/examples/config/deepspeed_zero3@_here_
+  - ../../ROLL/examples/config/deepspeed_zero3_cpuoffload@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "jidi_agentic_training"
+seed: 42
+# 使用环境变量传入的时间戳，确保所有日志在同一目录
+timestamp: ${oc.env:TRAINING_TIMESTAMP,${now:%Y%m%d_%H%M%S}}
+base_output_dir: /data1/Weiyu_project/roll_dev/experiments/jidi_environments_training/output
+logging_dir: ${base_output_dir}/${timestamp}/logs
+output_dir: ${base_output_dir}/${timestamp}
+render_save_dir: ${base_output_dir}/${timestamp}/render
+trajectory_log_dir: ${base_output_dir}/${timestamp}/trajectories
+system_envs:
+  USE_MODELSCOPE: '1'
+
+# 使用本地wandb，避免上传问题
+track_with: wandb
+tracker_kwargs:
+  project: roll-jidi-training
+  name: ${timestamp}_${exp_name}_jidi_environments
+  notes: "Jidi environments (CliffWalking, GridWorld, MiniGrid, Sokoban) training with async 8GPU setup"
+  tags:
+    - agentic
+    - roll
+    - async
+    - jidi
+    - cliffwalking
+    - gridworld
+    - minigrid
+    - sokoban
+    - vllm
+  mode: offline  # 设置为离线模式，避免上传
+  dir: ${base_output_dir}/${timestamp}/wandb
+
+checkpoint_config:
+  type: file_system
+  output_dir: ${base_output_dir}/${timestamp}/models/${exp_name}
+
+# 使用8张卡进行训练
+num_gpus_per_node: 7
+
+# === 基于 agent_val_frozen_lake_async.yaml 的异步训练参数 ===
+max_steps: 1024
+save_steps: 10000
+logging_steps: 1
+eval_steps: 10
+resume_from_checkpoint: false
+
+# 异步训练配置
+async_generation_ratio: 1
+
+rollout_batch_size: 768  # 3GPU: 768 = 3 × 256  
+val_batch_size: 768
+sequence_length: 4096  # Reduced to avoid memory issues
+
+advantage_clip: 0.2
+ppo_epochs: 1
+adv_estimator: "grpo"
+init_kl_coef: 0.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+# 使用本地模型路径
+pretrain: /data1/Weiyu_project/Models/downloaded_models/Qwen2.5-0.5B-Instruct
+reward_pretrain: /data1/Weiyu_project/Models/downloaded_models/Qwen2.5-0.5B-Instruct
+
+actor_train:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0
+    per_device_train_batch_size: 1  # 降低批次大小避免OOM
+    gradient_accumulation_steps: 128  # 减少以降低内存占用
+    warmup_steps: 10
+    lr_scheduler_type: cosine
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: megatron_train
+    strategy_config:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 1
+      use_distributed_optimizer: true
+      recompute_granularity: full
+  device_mapping: list(range(0,3))
+  infer_batch_size: 2
+
+actor_infer:
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: 64 # single-turn response length (reduced for memory)
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.99
+    num_return_sequences: 1
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: vllm  # 使用vLLM进行推理
+    strategy_config:
+      gpu_memory_utilization: 0.6  # 降低GPU内存使用率避免OOM
+      block_size: 16
+      load_format: auto
+  device_mapping: list(range(3,7))
+
+reference:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: hf_infer
+    strategy_config: ~
+  device_mapping: list(range(0,3))
+  infer_batch_size: 2
+
+# Jidi环境的动作格式配置
+action_pattern: <answer>(.*?)</answer>
+think_action_pattern: <think>(.*?)</think>\s*<answer>(.*?)</answer>
+user_prompt_no_think_format: <answer>your_action</answer>
+user_prompt_think_format: <think>your_thoughts</think> <answer>your_action</answer>
+added_text_no_think: <answer>
+added_text_think: <think>
+
+max_tokens_per_step: 128
+max_actions_per_traj: 20  # 增加最大步数以适应Jidi环境
+
+reward_normalization:
+  grouping: traj_group_id # 可以tags(env_type)/traj_group_id(group)/batch(rollout_batch)... group_by计算reward/adv
+  method: mean_std # asym_clip / identity / mean_std
+
+# 轨迹日志配置
+trajectory_logging:
+  enabled: true
+  log_dir: ${trajectory_log_dir}
+  log_level: "all"  # "all", "failed_only", "successful_only"
+  max_files_per_env: 1000  # 限制每个环境的文件数量
+  log_format: "jsonl"  # 使用jsonl格式
+
+train_env_manager:
+  format_penalty: -0.1  # 格式错误惩罚
+  max_env_num_per_worker: 16
+  num_env_groups: 112  # 环境组数量（7GPU优化）
+  # under the same group, the env config and env seed are ensured to be equal
+  group_size: 8  # 保持原始async版本的值
+  tags: [JidiCliffWalking, JidiGridWorld, JidiMiniGrid, JidiSokoban]
+  num_groups_partition: [28, 28, 28, 28] # 7GPU优化：4*28=112
+
+val_env_manager:
+  max_env_num_per_worker: 32
+  num_env_groups: 896  # 7GPU优化：能被4整除的数
+  group_size: 1 # should be set to 1 because val temperature is set to 0 and same prompt leads to same output
+  tags: [JidiCliffWalking, JidiGridWorld, JidiMiniGrid, JidiSokoban]
+  num_groups_partition: [224, 224, 224, 224] # 7GPU优化：4*224=896进行验证
+
+# 定义四个Jidi环境的配置
+custom_envs:
+  JidiCliffWalking:
+    env_type: jidi_cliffwalking
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_no_think_format}
+    added_text: ${added_text_no_think}
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    agent_system_template: ${agent_system_template}
+    agent_template: ${agent_template}
+    pre_step_template: ${pre_step_template}
+    next_step_template: ${next_step_template}
+    reward_template: ${reward_template}
+    env_config: # keys should be a subset of CliffWalkingConfig
+      env_instruction: "You are playing CliffWalking. Navigate from the start position to the goal while avoiding the cliff. The cliff is dangerous and will give you a large penalty. Move carefully using the available actions (up, down, left, right). Always respond with <answer>action</answer> format."
+      action_pattern: ${action_pattern}
+      max_steps: ${max_actions_per_traj}
+      max_tokens_per_step: ${max_tokens_per_step}
+
+  JidiGridWorld:
+    env_type: jidi_gridworld
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_no_think_format}
+    added_text: ${added_text_no_think}
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    agent_system_template: ${agent_system_template}
+    agent_template: ${agent_template}
+    pre_step_template: ${pre_step_template}
+    next_step_template: ${next_step_template}
+    reward_template: ${reward_template}
+    env_config: # keys should be a subset of GridWorldConfig
+      env_instruction: "You are playing GridWorld. Navigate through the grid from your starting position to reach the goal. Avoid walls and obstacles. Use the available movement actions (up, down, left, right). Always respond with <answer>action</answer> format."
+      action_pattern: ${action_pattern}
+      max_steps: ${max_actions_per_traj}
+      max_tokens_per_step: ${max_tokens_per_step}
+
+  JidiMiniGrid:
+    env_type: jidi_minigrid
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_no_think_format}
+    added_text: ${added_text_no_think}
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    agent_system_template: ${agent_system_template}
+    agent_template: ${agent_template}
+    pre_step_template: ${pre_step_template}
+    next_step_template: ${next_step_template}
+    reward_template: ${reward_template}
+    env_config: # keys should be a subset of MiniGridConfig
+      env_instruction: "You are playing MiniGrid. This is a partially observable grid world where you can only see a limited area around you. Navigate to complete the task using available actions (left, right, forward, pickup, drop, toggle, done). Always respond with <answer>action</answer> format."
+      action_pattern: ${action_pattern}
+      max_steps: ${max_actions_per_traj}
+      max_tokens_per_step: ${max_tokens_per_step}
+      jidi_env_name: "MiniGrid-DoorKey-16x16-v0"
+
+  JidiSokoban:
+    env_type: jidi_sokoban
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_no_think_format}
+    added_text: ${added_text_no_think}
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    agent_system_template: ${agent_system_template}
+    agent_template: ${agent_template}
+    pre_step_template: ${pre_step_template}
+    next_step_template: ${next_step_template}
+    reward_template: ${reward_template}
+    env_config: # keys should be a subset of SokobanConfig
+      env_instruction: "You are playing Sokoban. Push all the boxes to the target positions to solve the puzzle. You can only push boxes, not pull them. Be careful not to push boxes into corners where they cannot be moved. Use available actions (up, down, left, right). Always respond with <answer>action</answer> format."
+      action_pattern: ${action_pattern}
+      max_steps: ${max_actions_per_traj}
+      max_tokens_per_step: ${max_tokens_per_step}
+      jidi_env_name: "sokoban_1p"
+
+# 模板定义 - 必需的模板字段
+agent_system_template: "You're a helpful assistant. You are a good game player. You are aiming to get high reward in the game."
+agent_template: |
+  Turn {turn_idx}:
+  Current state: {state}
+  
+  You have {actions_left} actions left.
+  Max response length: {max_response_length} tokens.
+  
+  Choose your next action from the available actions.
+  Always output: <answer>your_action</answer> with no extra text.
+  Strictly follow this format.
+pre_step_template: "\nTurn {turn_idx}:\nState"
+next_step_template: |
+  You have {actions_left} actions left. 
+  Always output: <answer>your_action</answer> with no extra text. 
+  Strictly follow this format.
+  Max response length: {max_response_length} words (tokens).
+  Decide the next action:
+reward_template: "Reward: {reward}"
