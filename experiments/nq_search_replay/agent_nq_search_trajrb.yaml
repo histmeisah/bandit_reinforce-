@@ -1,5 +1,5 @@
 # ==============================================================================
-# NQ SEARCH TRAINING - Trajectory Replay Buffer + old_prob(turn + trainer)
+# NQ SEARCH TRAINING - Trajectory Replay Buffer + old_prob(trajectory + trainer)
 # ==============================================================================
 defaults:
   - ../../ROLL/examples/config/traj_envs@_here_
@@ -16,7 +16,7 @@ hydra:
 exp_name: "nq_search_agentic"
 seed: 42
 timestamp: ${oc.env:TRAINING_TIMESTAMP,${now:%Y%m%d_%H%M%S}}
-base_output_dir: /data1/Chengyang_project/roll_dev/experiments/nq_search_replay/output
+base_output_dir: /mnt/scimaster/shuotang/weiyu/roll_dev/experiments/nq_search_replay/output
 logging_dir: ${base_output_dir}/${timestamp}/logs
 output_dir: ${base_output_dir}/${timestamp}
 render_save_dir: ${base_output_dir}/${timestamp}/render
@@ -26,8 +26,8 @@ system_envs:
 track_with: wandb
 tracker_kwargs:
   project: roll-agentic-nq-search
-  name: ${timestamp}_${exp_name}_trajrb_turn_trainer
-  notes: "NQ Search with Trajectory ReplayBuffer + old_prob(turn+trainer)"
+  name: ${timestamp}_traj_replay_buffer_offpolicy_monitoring_trajectory_trainer
+  notes: "NQ Search with Trajectory ReplayBuffer + old_prob(trajectory+trainer)"
   tags: [agentic, roll, nq_search, replay, traj_rb, retrieval_qa]
   mode: offline
   dir: ${base_output_dir}/${timestamp}/wandb
@@ -42,7 +42,7 @@ checkpoint_config:
 
 num_gpus_per_node: 8
 
-max_steps: 100
+max_steps: 300
 save_steps: 10000
 logging_steps: 1
 eval_steps: 5
@@ -52,13 +52,13 @@ train_from_replay_only: false
 batch_adjust_mode: auto
 async_generation_ratio: 1
 
-# Batch and sequence settings
-rollout_batch_size: 128  # 1.5B 模型可以支持更大的 batch size
+# Batch and sequence settings (H200保守配置，避免OOM)
+rollout_batch_size: 128  # 保守配置
 val_batch_size: 128      
-sequence_length: 8192
+sequence_length: 12800    # 降低序列长度以节省显存
 
 # RL algorithm settings
-advantage_clip: 0.2
+advantage_clip: 20
 ppo_epochs: 1
 adv_estimator: "reinforce"
 init_kl_coef: 0.0
@@ -70,8 +70,8 @@ max_grad_norm: 1.0
 # MODEL CONFIGURATION
 # =============================================================================
 
-pretrain: /data1/models/pretrain/Qwen2.5-1.5B-Instruct
-reward_pretrain: /data1/models/pretrain/Qwen2.5-1.5B-Instruct
+pretrain: /mnt/scimaster/model/Qwen2.5-7B-Instruct/qwen2.5-7b-instruct
+reward_pretrain: /mnt/scimaster/model/Qwen2.5-7B-Instruct/qwen2.5-7b-instruct
 
 actor_train:
   model_args:
@@ -82,40 +82,36 @@ actor_train:
   training_args:
     learning_rate: 1.0e-6
     weight_decay: 0
-    per_device_train_batch_size: 1
-    gradient_accumulation_steps: 32  # rollout_batch_size(128) / per_device_train_batch_size(1) / 4 GPUs
+    per_device_train_batch_size: 1   # 全局有效batch size (Global Effective Batch Size) = per_device_train_batch_size × gradient_accumulation_steps × num_gpus
+    gradient_accumulation_steps: 16   #
     warmup_steps: 10
     lr_scheduler_type: cosine
   data_args:
     template: qwen2_5
   strategy_args:
-    strategy_name: megatron_train
-    strategy_config:
-      tensor_model_parallel_size: 1
-      pipeline_model_parallel_size: 1
-      expert_model_parallel_size: 1
-      use_distributed_optimizer: true
-      recompute_granularity: full
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero3}
   device_mapping: list(range(0,4))
-  infer_batch_size: 2
+  infer_batch_size: 1
 
 actor_infer:
   model_args:
     disable_gradient_checkpointing: true
     dtype: bf16
   generating_args:
-    max_new_tokens: 512  # 恢复原值，1.5B 模型可以支持
+    max_new_tokens: ${max_tokens_per_step} # single-turn response length
     top_p: 0.99
     top_k: 100
     num_beams: 1
     temperature: 0.99
     num_return_sequences: 1
+    stop_strings: ["</search>", "</answer>"]
   data_args:
     template: qwen2_5
   strategy_args:
     strategy_name: vllm
     strategy_config:
-      gpu_memory_utilization: 0.4  # 进一步降低以为 reference 模型留空间 (原: 0.8  -> 0.4)
+      gpu_memory_utilization: 0.8  # 适度提升，避免过度占用
       block_size: 16
       load_format: auto
   device_mapping: list(range(4,8))
@@ -132,7 +128,7 @@ reference:
     strategy_name: hf_infer
     strategy_config: ~
   device_mapping: list(range(0,4))
-  infer_batch_size: 1  # 降低以减少内存峰值（原: 2）
+  infer_batch_size: 1  # Reference模型保守配置，避免计算log_probs时OOM
 
 # =============================================================================
 # ENVIRONMENT CONFIGURATION
@@ -147,59 +143,104 @@ user_prompt_format: |
   OR
   <answer> [your final answer] </answer> (if you are ready to answer)
 
-max_tokens_per_step: 512  # 恢复原值，1.5B 模型可以支持
+max_tokens_per_step: 4096 
 max_actions_per_traj: 5
 
 reward_normalization:
-  grouping: traj_group_id
-  method: mean_std
+  grouping: batch
+  method: identity
 
 train_env_manager:
   format_penalty: -0.15
-  max_env_num_per_worker: 16  # 恢复原值，1.5B 模型显存充足
-  num_env_groups: 128         # 恢复原值，提升并发
-  group_size: 8               # 恢复原值
+  max_env_num_per_worker: 16  
+  num_env_groups: 64          # 减少环境组数，总计64×4=256个环境
+  group_size: 4               # 减少每组大小
   tags: [NQSearch]
-  num_groups_partition: [128] # 必须等于 num_env_groups
+  num_groups_partition: [64]  # 必须等于 num_env_groups
 
 val_env_manager:
-  max_env_num_per_worker: 32  # 恢复原值
-  num_env_groups: 512         # 适当提升（原 FrozenLake 是 1024，我们用一半）
+  max_env_num_per_worker: 16  # 大幅降低验证环境数量
+  num_env_groups: 32          # 从128降到32，总计32个验证环境
   group_size: 1
-  tags: [NQSearch]
-  num_groups_partition: [512] # 必须等于 num_env_groups
+  tags: [NQSearchVal]         # 使用独立的验证环境
+  num_groups_partition: [32]  # 必须等于 num_env_groups
 
 custom_envs:
   NQSearch:
     env_type: nq_search
     max_tokens_per_step: ${max_tokens_per_step}
     user_prompt_format: ${user_prompt_format}
-    agent_system_template: "You are a helpful AI assistant that can search for information and answer questions."
-    agent_template: |
-      Current turn: {turn_idx}
-      Previous actions: {actions_left}
-      
-      Please analyze the question and decide whether you need to search for more information or provide the final answer.
-      Use <think> to explain your reasoning, <search> to search for information, or <answer> to provide your final answer.
-      
-      You must respond within {max_response_length} tokens.
-    reward_template: "Feedback: Your previous action received reward {reward}. Continue or adjust your strategy."
+    # 移除所有template，直接使用环境返回的observation（包含NQ问题）
+    agent_system_template: ""  # 空字符串，避免null导致问题
+    agent_template: "{state}"  # TrajEnvManager使用'state'而不是'observation'
+    reward_template: ""  # 空字符串，不添加额外的reward反馈
     env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
     use_thread_lock: true
     env_config:
       # 数据集配置
-      dataset_path: /data1/Agentic_LLM-search/datasets/nq_search_converted/train_searchenv.parquet
-      max_instances: 1000
+      dataset_path: /mnt/scimaster/shuotang/weiyu/roll_dev/data/nq_search_converted/train_converted.parquet
+      max_instances: 2000  # H200显存充足，增加训练样本数
       
       # 检索服务器配置
-      retrieval_server_url: http://127.0.0.1:8100/retrieve
+      retrieval_server_url: http://127.0.0.1:8000/retrieve
       retrieval_timeout: 30
       retrieval_topk: 3
       return_scores: true
       
       # 限流配置
-      max_concurrent_calls: 5
+      max_concurrent_calls: 100 # H200显存充足，提升并发检索能力
       limiter_tag: nq_search_env
+      disable_limiter: false
+      
+      # 环境设置
+      max_steps: ${max_actions_per_traj}
+      max_search_calls: 5
+      
+      # 动作解析模式
+      think_pattern: <think>(.*?)</think>
+      search_pattern: <search>(.*?)</search>
+      answer_pattern: <answer>(.*?)</answer>
+      
+      # 奖励设置
+      use_outcome_reward_only: true
+      correct_answer_reward: 1.0
+      step_penalty: 0.0
+      invalid_action_penalty: 0.0
+      
+      # EM评估配置
+      use_em_evaluation: true
+      em_ignore_case: true
+      em_ignore_punctuation: true
+      em_ignore_articles: true
+      
+      # 特殊标记
+      special_token_list: ["<think>", "</think>", "<search>", "</search>", "<answer>", "</answer>", "<information>", "</information>"]
+
+  # 验证环境配置（使用测试集）
+  NQSearchVal:
+    env_type: nq_search
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_format}
+    # 移除所有template，直接使用环境返回的observation（包含NQ问题）
+    agent_system_template: ""  # 空字符串，避免null导致问题
+    agent_template: "{state}"  # TrajEnvManager使用'state'而不是'observation'
+    reward_template: ""  # 空字符串，不添加额外的reward反馈
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    env_config:
+      # 数据集配置 - 使用测试集
+      dataset_path: /mnt/scimaster/shuotang/weiyu/roll_dev/data/nq_search_converted/test_converted.parquet
+      max_instances: 1000  # H200显存充足，增加验证样本数
+      
+      # 检索服务器配置
+      retrieval_server_url: http://127.0.0.1:8000/retrieve
+      retrieval_timeout: 30
+      retrieval_topk: 3
+      return_scores: true
+      
+      # 限流配置
+      max_concurrent_calls: 100 # H200显存充足，提升验证并发能力
+      limiter_tag: nq_search_val_env
       disable_limiter: false
       
       # 环境设置
@@ -237,7 +278,7 @@ offpolicy_monitor:
   # Behavior policy log probs computation
   save_behavior_log_probs: true  # Compute and save after rollout
   behavior_compute: trainer  # trainer (recompute, accurate) | engine (use inference logprobs, faster)
-  behavior_scope: turn  # turn (last assistant turn) | trajectory (full response)
+  behavior_scope: trajectory  # turn (last assistant turn) | trajectory (full response)
 
   # Monitoring targets
   monitor_fresh_batch: true  # Monitor fresh rollout batches
@@ -247,15 +288,39 @@ offpolicy_monitor:
 # =============================================================================
 # TRAJECTORY REPLAY BUFFER CONFIGURATION
 # =============================================================================
+# See detailed documentation: roll_dev/ROLL/docs/replay_buffer.md
+# Following OpenAI Baselines and RLlib design patterns for priority-based replay
 
 replay:
   enabled: true
-  capacity: 50000  # Max trajectories in buffer
-  min_size: ${rollout_batch_size}  # Start sampling when buffer has this many samples
-  train_steps_per_env_step: 1  # Additional training steps per rollout step
-  use_rollout_batch_size: true  # Use rollout_batch_size for replay sampling
-  sampling_mode: "trajectory"  # trajectory (full episodes) | step (per-step sampling)
-  sample_method: lifo  # lifo (newest) | fifo (oldest) | uniform (random)
-  storage_mode: tokens_only  # tokens_only | text_only | hybrid
-  lazy_tokenization: false  # Tokenize during storage (false) or sampling (true)
+  capacity: 50000  # Max trajectories stored
+  min_size: ${rollout_batch_size}  # Min samples before training
+  train_steps_per_env_step: 1  # Training iterations per rollout (1=50% replay, 3=75% replay)
+  use_rollout_batch_size: true  # Use rollout_batch_size for sampling
+
+  # Prioritized Experience Replay (PER) Configuration
+  # See docs: roll_dev/ROLL/docs/replay_buffer.md for details
+  priority:
+    # Sampling strategy (which experiences to sample)
+    function: lifo  # lifo | fifo | uniform | reward | td_error | recency | combined | advantage | length
+    alpha: 0.6  # Priority exponent (0.0=uniform, 0.6=moderate, 1.0=full prioritization)
+
+    # Function-specific parameters
+    kwargs:
+      # For recency: decay_rate: 0.001
+      # For combined: reward_weight: 0.7, recency_weight: 0.3, decay_rate: 0.001
+      # For length: prefer_long: true
+
+    # Priority update after training (feedback loop for PER)
+    update_after_train: false  # Enable priority backfill from training loss
+    update_metric: loss  # loss | advantage | kl | reward
+
+    # Importance sampling (off-policy bias correction)
+    use_importance_weights: false  # Apply IS weights to training loss
+    importance_beta: 0.4  # Beta for IS weights (0.4→1.0 annealing)
+
+  # Other settings
+  sampling_mode: "trajectory"  # trajectory | step
+  storage_mode: tokens_only    # tokens_only | text_only | hybrid
+  lazy_tokenization: false
 

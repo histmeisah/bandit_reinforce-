@@ -1,0 +1,79 @@
+# FrozenLake Trajectory-Level Replay with Age-Advantage Priority
+#
+# Key Features:
+#   - Trajectory-level replay buffer (complete episodes)
+#   - Two-stage priority: reward (initial) → advantage (updated)
+#   - Age-based freshness weighting
+#   - No n-step returns (trajectory-level already has full episode reward)
+#
+# Priority Strategy:
+#   Initial (push):  priority = |episode_reward|
+#   Updated (train): priority = |advantage|
+#   Effective:       effective_priority = priority * exp(-age / age_decay)
+#
+# Usage:
+#   python start_agentic_pipeline.py --config_path experiments/reproduce_frozen_lake_replay/agent_val_frozen_lake_traj_age_advantage.yaml
+
+# Replay Buffer (Trajectory-Level with Age-Advantage Priority)
+replay:
+  enabled: true
+  capacity: 50000  # Number of complete episodes
+  use_rollout_batch_size: true
+  sampling_mode: trajectory
+  sample_method: uniform
+  train_steps_per_env_step: 2
+  skip_fresh_data: false
+
+  # Age-Based Freshness Weighting
+  age_decay: 500.0
+  # Smaller decay for FrozenLake (short episodes, fast training)
+  # age=500 steps: freshness_weight ≈ 0.37
+  # Adjust based on training speed:
+  #   - Fast training (FrozenLake): 100-500
+  #   - Slow training (Complex tasks): 1000-5000
+
+  # Advantage-Based Priority Update
+  use_advantage_priority: true
+  # Automatically uses |advantage| after training
+  # No n-step returns needed (trajectory-level has full episode return)
+
+  # Initial Priority Function (used at push time)
+  priority:
+    function: reward  # Use |episode_reward| as initial priority
+    alpha: 0.6  # Priority exponent
+    use_importance_weights: true
+    importance_beta: 0.4
+
+# Token-Level GAE (Inner Layer)
+adv_estimator: gae
+gamma: 0.995  # γ_token for inner layer
+lambd: 0.95
+advantage_clip: 10.0
+whiten_advantages: true
+
+# Environment
+train_env_manager:
+  type: trajectory
+  num_env_groups: 64
+  group_size: 1
+  tags: [FrozenLake]
+  max_steps_per_episode: 100
+
+# Training
+rollout_batch_size: 128
+sequence_length: 512
+max_steps: 10000
+logging_steps: 10
+eval_steps: 500
+
+# Optimizer
+actor_lr: 3.0e-5
+critic_lr: 1.0e-4
+pg_clip: 0.2
+kl_penalty: kl
+reward_clip: 10.0
+
+# Monitoring
+offpolicy_monitor:
+  enabled: true
+  monitor_replay_batch: true

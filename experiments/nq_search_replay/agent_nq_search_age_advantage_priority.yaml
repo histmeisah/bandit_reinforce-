@@ -1,0 +1,90 @@
+# NQ Search with Age-Aware Advantage-Based Priority Replay
+#
+# Key Features:
+#   - Step-level replay buffer for multi-step search
+#   - Two-stage priority: reward (initial) → advantage (updated)
+#   - Age-based freshness weighting: Balance value vs recency
+#   - N-step returns for better credit assignment
+#
+# Priority Strategy:
+#   Initial (push):  priority = |reward| or |nstep_returns|
+#   Updated (train): priority = |advantage|
+#   Effective:       effective_priority = priority * exp(-age / age_decay)
+#
+# Usage:
+#   python start_agentic_pipeline.py --config_path experiments/nq_search_replay/agent_nq_search_age_advantage_priority.yaml
+
+# Replay Buffer (Step-Level with Age-Advantage Priority)
+replay:
+  enabled: true
+  capacity: 100000
+  use_rollout_batch_size: true
+  sampling_mode: step
+  sample_method: uniform
+  train_steps_per_env_step: 3
+  skip_fresh_data: false
+
+  # N-Step Returns Configuration (Outer Layer)
+  enable_nstep: true
+  n_step: 7  # Longer horizon for search
+  nstep_gamma: 0.99  # γ_step for outer layer
+  use_nstep_in_advantage: true  # Use n-step returns in advantage computation
+  use_bootstrap: false
+
+  # Age-Based Freshness Weighting
+  age_decay: 1000.0
+  # Interpretation:
+  #   - age=1000 steps: freshness_weight = exp(-1) ≈ 0.37
+  #   - age=2000 steps: freshness_weight = exp(-2) ≈ 0.14
+  #   - Larger age_decay (e.g., 5000): Slower decay, old samples stay relevant
+  #   - Smaller age_decay (e.g., 500): Faster decay, strong preference for fresh
+
+  # Advantage-Based Priority Update
+  use_advantage_priority: true
+  # Two-stage strategy:
+  #   1. Initial (push): Use reward-based priority function
+  #   2. Updated (after training): Use |advantage| from compute_advantage()
+  # This combines reward signal (initial guess) with learning signal (advantage)
+
+  # Initial Priority Function (used at push time)
+  priority:
+    function: reward  # Use |reward| or |nstep_returns| as initial priority
+    alpha: 0.6  # Priority exponent for weighted sampling
+    use_importance_weights: true
+    importance_beta: 0.4  # Annealing: 0.4 → 1.0
+    # Note: update_after_train and update_metric are overridden by use_advantage_priority
+
+# Token-Level GAE (Inner Layer)
+adv_estimator: gae
+gamma: 0.998  # γ_token for inner layer (very close to 1.0 for search)
+lambd: 0.95
+advantage_clip: 15.0
+whiten_advantages: true
+
+# Environment
+train_env_manager:
+  type: step
+  num_env_groups: 128
+  group_size: 1
+  tags: [WebSearch]
+  max_steps_per_episode: 20
+
+# Training
+rollout_batch_size: 256
+sequence_length: 1024
+max_steps: 50000
+logging_steps: 20
+eval_steps: 1000
+
+# Optimizer
+actor_lr: 3.0e-6
+critic_lr: 1.0e-5
+pg_clip: 0.2
+kl_penalty: kl
+reward_clip: 20.0
+
+# Monitoring
+offpolicy_monitor:
+  enabled: true
+  monitor_replay_batch: true
+  log_priority_stats: true  # Log age/priority distribution

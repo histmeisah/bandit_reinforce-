@@ -1,0 +1,59 @@
+# FrozenLake Step-Level Replay Buffer with N-Step Returns
+#
+# Key Features:
+#   - Step-level replay buffer
+#   - N-step returns (outer layer): Better long-term credit assignment
+#   - Token-level GAE (inner layer): Within-response credit assignment
+#
+# Usage:
+#   python start_agentic_pipeline.py --config_path experiments/reproduce_frozen_lake_replay/agent_val_frozen_lake_step_replay_nstep.yaml
+
+# Replay Buffer (Step-Level with N-Step Returns)
+replay:
+  enabled: true
+  capacity: 50000
+  use_rollout_batch_size: true
+  sampling_mode: step
+  sample_method: uniform
+  train_steps_per_env_step: 2
+  skip_fresh_data: false
+
+  # N-Step Returns Configuration
+  enable_nstep: true
+  n_step: 5
+  nstep_gamma: 0.99  # γ_step for outer layer
+  use_nstep_in_advantage: true  # Enable n-step in advantage computation
+  use_bootstrap: false
+
+  # Priority (optional)
+  priority:
+    function: uniform
+    alpha: 0.6
+
+# Token-Level GAE (Inner Layer)
+adv_estimator: gae
+gamma: 0.995  # γ_token for inner layer (close to 1.0)
+lambd: 0.95
+advantage_clip: 10.0
+whiten_advantages: true
+
+# Environment
+train_env_manager:
+  type: step
+  num_env_groups: 64
+  group_size: 1
+  tags: [FrozenLake]
+  max_steps_per_episode: 50
+
+# Training
+rollout_batch_size: 128
+sequence_length: 512
+max_steps: 10000
+logging_steps: 10
+eval_steps: 500
+
+# Other standard configs...
+actor_lr: 5.0e-6
+critic_lr: 1.0e-5
+pg_clip: 0.2
+kl_penalty: kl

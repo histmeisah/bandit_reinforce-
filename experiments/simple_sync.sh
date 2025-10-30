@@ -6,7 +6,7 @@
 set -e
 
 # 配置 - 直接填写绝对路径
-WANDB_DIR="/data1/Chengyang_project/roll_dev/experiments/nq_search_replay/output/20251019_143839/wandb/wandb/offline-run-20251019_143907-nlbzc7wc"
+WANDB_DIR="E:\code_project\python_code\local_roll_dev\roll_dev\experiments\nq_search_replay\output\offline-run-20251024_131308-osebgtlq"
 PROXY_HOST="127.0.0.1"
 PROXY_PORT="7898"
 WANDB_PROJECT="roll_async_env"

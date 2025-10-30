@@ -5,9 +5,20 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# 设置环境变量（适配Docker环境）
-export ROLL_PATH="/data1/Chengyang_project/roll_dev/ROLL"
+export ROLL_PATH="/mnt/scimaster/shuotang/weiyu/roll_dev/ROLL"
 export PYTHONPATH="$ROLL_PATH:$PYTHONPATH"
+
+source /mnt/scimaster/conda/miniconda/bin/activate
+conda activate roll
+
+# 确保使用conda环境中的ray（而不是系统或base环境的ray）
+export PATH="/mnt/scimaster/conda/miniconda/envs/roll/bin:$PATH"
+
+# 清除可能干扰Ray的环境变量（让ROLL使用默认值127.0.0.1）
+unset MASTER_ADDR
+unset MASTER_PORT
+unset RAY_ADDRESS
+unset RAY_NODE_IP_ADDRESS
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
@@ -61,6 +72,17 @@ else
 fi
 echo ""
 
+# 清理可能存在的旧Ray集群
+echo "========================================"
+echo "Cleaning up any existing Ray clusters..."
+echo "========================================"
+ray stop --force 2>/dev/null || true
+pkill -9 ray 2>/dev/null || true
+rm -rf /tmp/ray/* 2>/dev/null || true
+echo "Cleanup completed. ROLL will manage Ray initialization."
+echo "========================================"
+echo ""
+
 # 启动训练
 cd "$ROLL_PATH"
 echo "Training started at $(date)"
@@ -69,9 +91,12 @@ echo "Using unified timestamp: $TRAINING_TIMESTAMP"
 
 python examples/start_agentic_pipeline.py \
     --config_path ../../experiments/reproduce_frozen_lake_replay \
-    --config_name agent_val_frozen_lake_trajrb_step_trainer
+    --config_name agent_val_frozen_lake_trajrb_step_trainer_deepspeed
 
 echo "Training completed at $(date)"
+
+# ROLL会自动管理Ray集群的清理
+
 echo "All logs unified in directory: $OUTPUT_DIR"
 echo "Training log: $LOG_FILE"
 echo "Wandb logs: $WANDB_DIR"
