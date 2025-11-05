@@ -1,0 +1,32 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+
+\title{\textbf{Bandit-REINFORCE++}}
+\author{Weiyu Ma}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Motivation}
+Bandit problems are a classical class of reinforcement learning problems that typically involve single-state, one-step decision-making without state transitions. In the context of LLM post-training for mathematical reasoning, the model receives a question prompt $y$ and needs to generate an answer $x$. I observe that we can naturally view $y$ as the state and the correctness of the answer as the reward. Since each problem-solving episode involves generating a complete solution trajectory without meaningful intermediate state transitions, this problem structure closely resembles a contextual bandit setting rather than a sequential MDP.
+
+Current approaches for LLM reasoning tasks either use Best-of-N sampling which greedily exploits the highest reward trajectory, or vanilla REINFORCE++ which randomly selects a single trajectory for policy updates. These methods suffer from poor sample efficiency and lack principled mechanisms for balancing exploration and exploitation. Given that we sample multiple trajectories per problem anyway, 
+
+\section{Proposed Method}
+
+My core insight is that each generated trajectory $\tau$ has a well-defined generation probability $P(\tau|y) = \prod_{t=1}^{T} P(a_t|s_t)$ which can be computed as log-probability $\ell(\tau) = \sum_{t=1}^{T} \log P(a_t|s_t)$ during generation. My hypothesis is that trajectories with similar log-probabilities tend to share similar generation patterns and solution quality, providing a natural similarity measure for discretizing the trajectory space into arms.
+
+I plan to integrate classical bandit algorithms including UCB (Upper Confidence Bound) and Thompson Sampling with REINFORCE++ for trajectory selection. During training, I will sample multiple trajectories per problem and use their log-probabilities to assign them to bins. The bandit algorithm then selects which trajectory to use for the policy gradient update, naturally balancing exploration of different probability regions with exploitation of high-reward trajectories.
+
+For implementation, I will use the ROLL framework (\url{https://github.com/alibaba/ROLL/tree/main/roll}) and train on Qwen2.5-3B-Instruct or Qwen2.5-7B-Instruct models.
+
+\section{Evaluation Plan}
+
+I plan to evaluate my method on mathematical reasoning benchmarks including AIME 2024 and 2025, MATH-500, and GSM8K. These datasets provide verifiable ground-truth answers allowing me to compute exact binary rewards without needing a reward model. I will compare against vanilla REINFORCE++ with random trajectory selection, Best-of-N sampling, and entropy-regularized methods.
+
+My primary metrics will be Pass@1 accuracy and Pass@K to measure both policy quality and sampling diversity. I will also track sample efficiency and conduct ablation studies on the number of bins $K$ and exploration parameters to understand their impact on performance.
+
+\end{document}

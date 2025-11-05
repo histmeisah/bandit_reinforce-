@@ -10,7 +10,7 @@ from pathlib import Path
 
 # ========== 配置区 ==========
 # 修改这里的路径即可
-OFFLINE_PATH = r"E:\code_project\python_code\local_roll_dev\roll_dev\experiments\nq_search_replay\output\offline-run-20251028_134559-mjtq0htd"
+OFFLINE_PATH = r"E:\code_project\python_code\local_roll_dev\roll_dev\experiments\nq_search_replay\output\offline-run-20251102_211122-lvv2ebot"
 
 # WandB配置（从simple_sync.sh提取）
 WANDB_API_KEY = "5d830c409e2aa7dff34c333a2f79798a877bfc7b"

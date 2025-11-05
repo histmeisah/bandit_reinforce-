@@ -1,5 +1,5 @@
 # ==============================================================================
-# FROZENLAKE TRAINING - Trajectory Replay Buffer + old_prob(turn + engine)
+# FROZENLAKE TRAINING - Trajectory Replay Buffer + Age-Advantage Priority + Off-Policy Filter
 # ==============================================================================
 defaults:
   - ../../ROLL/examples/config/traj_envs@_here_
@@ -13,7 +13,7 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "agentic_pipeline"
+exp_name: "frozen_lake_trajrb_age_advantage_filter"
 seed: 42
 timestamp: ${oc.env:TRAINING_TIMESTAMP,${now:%Y%m%d_%H%M%S}}
 base_output_dir: /data1/Chengyang_project/roll_dev/experiments/reproduce_frozen_lake_replay/output
@@ -26,9 +26,9 @@ system_envs:
 track_with: wandb
 tracker_kwargs:
   project: roll-agentic-replay
-  name: ${timestamp}_${exp_name}_trajrb_turn_engine_oldprob_engine
-  notes: "Trajectory ReplayBuffer + old_prob(turn+engine)"
-  tags: [agentic, roll, frozen_lake, replay, traj_rb, step_oldprob, engine]
+  name: ${timestamp}_trajrb_age_advantage_filter
+  notes: "FrozenLake: Trajectory ReplayBuffer + Age-Advantage Priority + Off-Policy Filter"
+  tags: [agentic, roll, frozen_lake, replay, traj_rb, age_advantage_priority, offpolicy_filter]
   mode: offline
   dir: ${base_output_dir}/${timestamp}/wandb
 
@@ -89,13 +89,8 @@ actor_train:
   data_args:
     template: qwen2_5
   strategy_args:
-    strategy_name: megatron_train
-    strategy_config:
-      tensor_model_parallel_size: 1
-      pipeline_model_parallel_size: 1
-      expert_model_parallel_size: 1
-      use_distributed_optimizer: true
-      recompute_granularity: full
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero3}
   device_mapping: list(range(0,4))
   infer_batch_size: 2
 
@@ -115,10 +110,10 @@ actor_infer:
   strategy_args:
     strategy_name: vllm
     strategy_config:
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.4
       block_size: 16
       load_format: auto
-  device_mapping: list(range(4,8))
+  device_mapping: list(range(6,8))  # Changed from 4-7 to 6-7 to avoid conflict with reference
 
 reference:
   model_args:
@@ -131,7 +126,7 @@ reference:
   strategy_args:
     strategy_name: hf_infer
     strategy_config: ~
-  device_mapping: list(range(0,4))
+  device_mapping: list(range(4,6))  # Changed from 0-3 to 4-5 to avoid GPU conflict with actor_train
   infer_batch_size: 2
 
 # =============================================================================
@@ -190,34 +185,65 @@ custom_envs:
 # =============================================================================
 # OFF-POLICY MONITORING CONFIGURATION
 # =============================================================================
-# Independent of replay buffer - can monitor fresh batches, replay batches, or both
 
 offpolicy_monitor:
-  enabled: true  # Enable off-policy monitoring
-
-  # Behavior policy log probs computation
-  save_behavior_log_probs: true  # Compute and save after rollout
-  behavior_compute: trainer  # trainer (recompute, accurate) | engine (use inference logprobs, faster)
-  behavior_scope: turn  # turn (last assistant turn) | trajectory (full response)
-
-  # Monitoring targets
-  monitor_fresh_batch: true  # Monitor fresh rollout batches
-  monitor_replay_batch: true  # Monitor replay buffer batches
-  monitor_interval: 1  # Monitor every N steps
+  enabled: true
+  save_behavior_log_probs: true
+  behavior_compute: trainer
+  behavior_scope: turn
+  monitor_fresh_batch: true
+  monitor_replay_batch: true
+  monitor_interval: 1
 
 # =============================================================================
-# TRAJECTORY REPLAY BUFFER CONFIGURATION
+# TRAJECTORY REPLAY BUFFER + AGE-ADVANTAGE PRIORITY + OFF-POLICY FILTER
 # =============================================================================
 
 replay:
   enabled: true
-  capacity: 100000  # Max trajectories in buffer
-  min_size: ${rollout_batch_size}  # Start sampling when buffer has this many samples
-  train_steps_per_env_step: 1  # Additional training steps per rollout step
-  use_rollout_batch_size: true  # Use rollout_batch_size for replay sampling
-  sampling_mode: "trajectory"  # trajectory (full episodes) | step (per-step sampling)
-  sample_method: lifo  # lifo (newest) | fifo (oldest) | uniform (random)
-  storage_mode: tokens_only  # tokens_only | text_only | hybrid
-  lazy_tokenization: false  # Tokenize during storage (false) or sampling (true)
+  capacity: 5000 # Max trajectories in buffer
+  min_size: ${rollout_batch_size}
+  train_steps_per_env_step: 2  # Train 2 times per rollout
+  use_rollout_batch_size: true
+  sampling_mode: "trajectory"
+  storage_mode: tokens_only
+  lazy_tokenization: false
+
+  # Age-Based Freshness Weighting
+  age_decay: 500.0  # Smaller for FrozenLake (fast training)
+
+  # Advantage-Based Priority Update
+  use_advantage_priority: true  # Enable advantage-based priority after training
+
+  # Initial Priority Function (at push time)
+  priority:
+    function: reward  # Use |episode_reward| as initial priority
+    alpha: 0.6  # Priority exponent
+    use_importance_weights: true
+    importance_beta: 0.4
+
+  # =========================================================================
+  # OFF-POLICY FILTER CONFIGURATION (New Feature)
+  # =========================================================================
+  enable_offpolicy_filter: true  # Enable off-policy filtering for ratio statistics collection
+  ratio_clip_max: 3.0  # Maximum importance sampling ratio threshold (will collect stats to tune this)
+  filter_mini_batch_size: 32  # Mini-batch size for filtering (reduces GPU memory, also the minimum size)
+  filter_max_attempts: 20  # Maximum mini-batches to try before fallback
+  filter_min_acceptable_batch: 64  # Min samples needed, otherwise supplement with unfiltered
+
+  # Adaptive Mini-Batch Configuration (自适应mini_batch_size)
+  filter_adaptive_mini_batch: true  # 启用自适应mini_batch_size调整
+  filter_success_rate_window: 5  # 滑动窗口大小：记录最近5次成功率，平滑调整
+  # 自适应策略：
+  # - 成功率≥95%: 直接设为target_batch_size (一次采样成功)
+  # - 成功率≥90%: 翻倍增长 (例如 32→64→128)
+  # - 成功率≥70%: 增长1.5倍 (例如 32→48→72)
+  # - 成功率<70%: 回退到filter_mini_batch_size (32)
+
+  # Filtering flow:
+  # 1. Sample mini-batches (32 samples each, adaptive increase) and filter
+  # 2. Early stop when collected enough valid samples (128)
+  # 3. If < 64 valid samples, supplement with unfiltered samples
+  # 4. If 0 valid samples after max_attempts, fallback to unfiltered batch
 
 
