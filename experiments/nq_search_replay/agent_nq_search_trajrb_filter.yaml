@@ -1,5 +1,5 @@
 # ==============================================================================
-# NQ SEARCH TRAINING - Trajectory Replay Buffer + Age-Advantage Priority
+# NQ SEARCH TRAINING - Trajectory Replay Buffer + Off-Policy Filter
 # ==============================================================================
 defaults:
   - ../../ROLL/examples/config/traj_envs@_here_
@@ -13,7 +13,7 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "nq_search_trajrb_age_advantage"
+exp_name: "nq_search_agentic"
 seed: 42
 timestamp: ${oc.env:TRAINING_TIMESTAMP,${now:%Y%m%d_%H%M%S}}
 base_output_dir: /mnt/scimaster/shuotang/weiyu/roll_dev/experiments/nq_search_replay/output
@@ -26,9 +26,9 @@ system_envs:
 track_with: wandb
 tracker_kwargs:
   project: roll-agentic-nq-search
-  name: ${timestamp}_trajrb_age_advantage_priority
-  notes: "NQ Search: Trajectory ReplayBuffer + Age-Advantage Priority"
-  tags: [agentic, roll, nq_search, replay, traj_rb, age_advantage_priority, retrieval_qa]
+  name: ${timestamp}_traj_rb_offpolicy_filter
+  notes: "NQ Search with Trajectory ReplayBuffer + Off-Policy Filter"
+  tags: [agentic, roll, nq_search, replay, traj_rb, filter, retrieval_qa]
   mode: offline
   dir: ${base_output_dir}/${timestamp}/wandb
 
@@ -52,15 +52,15 @@ train_from_replay_only: false
 batch_adjust_mode: auto
 async_generation_ratio: 1
 
-# Batch and sequence settings (H200保守配置，避免OOM)
-rollout_batch_size: 128  # 保守配置
+# Batch and sequence settings
+rollout_batch_size: 128
 val_batch_size: 128
-sequence_length: 12800    # 降低序列长度以节省显存
+sequence_length: 12800
 
 # RL algorithm settings
 advantage_clip: 20
 ppo_epochs: 1
-adv_estimator: "reinforce"  # Use REINFORCE for trajectory-level
+adv_estimator: "reinforce"
 init_kl_coef: 0.0
 whiten_advantages: true
 entropy_loss_coef: 0
@@ -82,15 +82,15 @@ actor_train:
   training_args:
     learning_rate: 1.0e-6
     weight_decay: 0
-    per_device_train_batch_size: 1   # 全局有效batch size = per_device × gradient_accumulation × num_gpus
-    gradient_accumulation_steps: 32  # 从16改为32，使训练batch size=128，与rollout_batch_size一致
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 16
     warmup_steps: 10
     lr_scheduler_type: cosine
   data_args:
     template: qwen2_5
   strategy_args:
     strategy_name: deepspeed_train
-    strategy_config: ${deepspeed_zero3}  # Use Zero-3 for better memory efficiency (single-node 8 GPUs, NVLink bandwidth is sufficient)
+    strategy_config: ${deepspeed_zero3}
   device_mapping: list(range(0,4))
   infer_batch_size: 1
 
@@ -99,7 +99,7 @@ actor_infer:
     disable_gradient_checkpointing: true
     dtype: bf16
   generating_args:
-    max_new_tokens: ${max_tokens_per_step} # single-turn response length
+    max_new_tokens: ${max_tokens_per_step}
     top_p: 0.99
     top_k: 100
     num_beams: 1
@@ -111,7 +111,7 @@ actor_infer:
   strategy_args:
     strategy_name: vllm
     strategy_config:
-      gpu_memory_utilization: 0.5
+      gpu_memory_utilization: 0.8
       block_size: 16
       load_format: auto
   device_mapping: list(range(4,8))
@@ -127,14 +127,13 @@ reference:
   strategy_args:
     strategy_name: hf_infer
     strategy_config: ~
-  device_mapping: list(range(4,8))  # Changed: Move to GPU 4-7 (same as actor_infer) to avoid GPU 0 OOM
+  device_mapping: list(range(0,4))
   infer_batch_size: 1
 
 # =============================================================================
 # ENVIRONMENT CONFIGURATION
 # =============================================================================
 
-# NQ Search 使用 <think>, <search>, <answer> 三个标签
 action_pattern: (<think>.*?</think>.*?(<search>.*?</search>|<answer>.*?</answer>))
 think_action_pattern: <think>(.*?)</think>\s*(?:<search>(.*?)</search>|<answer>(.*?)</answer>)
 user_prompt_format: |
@@ -153,33 +152,32 @@ reward_normalization:
 train_env_manager:
   format_penalty: -0.15
   max_env_num_per_worker: 16
-  num_env_groups: 64          # 减少环境组数，总计64×4=256个环境
-  group_size: 4               # 减少每组大小
+  num_env_groups: 64
+  group_size: 4
   tags: [NQSearch]
-  num_groups_partition: [64]  # 必须等于 num_env_groups
+  num_groups_partition: [64]
 
 val_env_manager:
-  max_env_num_per_worker: 16  # 大幅降低验证环境数量
-  num_env_groups: 32          # 从128降到32，总计32个验证环境
+  max_env_num_per_worker: 16
+  num_env_groups: 32
   group_size: 1
-  tags: [NQSearchVal]         # 使用独立的验证环境
-  num_groups_partition: [32]  # 必须等于 num_env_groups
+  tags: [NQSearchVal]
+  num_groups_partition: [32]
 
 custom_envs:
   NQSearch:
     env_type: nq_search
     max_tokens_per_step: ${max_tokens_per_step}
     user_prompt_format: ${user_prompt_format}
-    # 移除所有template，直接使用环境返回的observation（包含NQ问题）
-    agent_system_template: ""  # 空字符串，避免null导致问题
-    agent_template: "{state}"  # TrajEnvManager使用'state'而不是'observation'
-    reward_template: ""  # 空字符串，不添加额外的reward反馈
+    agent_system_template: ""
+    agent_template: "{state}"  # TrajEnvManager uses 'state'
+    reward_template: ""
     env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
     use_thread_lock: true
     env_config:
       # 数据集配置
       dataset_path: /mnt/scimaster/shuotang/weiyu/roll_dev/data/nq_search_converted/train_converted.parquet
-      max_instances: 2000  # H200显存充足，增加训练样本数
+      max_instances: 2000
 
       # 检索服务器配置
       retrieval_server_url: http://127.0.0.1:8000/retrieve
@@ -188,7 +186,7 @@ custom_envs:
       return_scores: true
 
       # 限流配置
-      max_concurrent_calls: 100 # H200显存充足，提升并发检索能力
+      max_concurrent_calls: 100
       limiter_tag: nq_search_env
       disable_limiter: false
 
@@ -216,21 +214,20 @@ custom_envs:
       # 特殊标记
       special_token_list: ["<think>", "</think>", "<search>", "</search>", "<answer>", "</answer>", "<information>", "</information>"]
 
-  # 验证环境配置（使用测试集）
+  # 验证环境配置
   NQSearchVal:
     env_type: nq_search
     max_tokens_per_step: ${max_tokens_per_step}
     user_prompt_format: ${user_prompt_format}
-    # 移除所有template，直接使用环境返回的observation（包含NQ问题）
-    agent_system_template: ""  # 空字符串，避免null导致问题
-    agent_template: "{state}"  # TrajEnvManager使用'state'而不是'observation'
-    reward_template: ""  # 空字符串，不添加额外的reward反馈
+    agent_system_template: ""
+    agent_template: "{state}"  # TrajEnvManager uses 'state'
+    reward_template: ""
     env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
     use_thread_lock: true
     env_config:
       # 数据集配置 - 使用测试集
       dataset_path: /mnt/scimaster/shuotang/weiyu/roll_dev/data/nq_search_converted/test_converted.parquet
-      max_instances: 1000  # H200显存充足，增加验证样本数
+      max_instances: 1000
 
       # 检索服务器配置
       retrieval_server_url: http://127.0.0.1:8000/retrieve
@@ -239,7 +236,7 @@ custom_envs:
       return_scores: true
 
       # 限流配置
-      max_concurrent_calls: 100 # H200显存充足，提升验证并发能力
+      max_concurrent_calls: 100
       limiter_tag: nq_search_val_env
       disable_limiter: false
 
@@ -279,55 +276,36 @@ offpolicy_monitor:
   monitor_interval: 1
 
 # =============================================================================
-# TRAJECTORY REPLAY BUFFER + AGE-ADVANTAGE PRIORITY + OFF-POLICY FILTER
+# TRAJECTORY REPLAY BUFFER WITH OFF-POLICY FILTER
 # =============================================================================
+# Filters out samples with large importance sampling ratios
+# Prevents training instability from off-policy data
 
 replay:
   enabled: true
-  capacity: 10000  # Increased from 5000 for better diversity with smart eviction
+  capacity: 50000  # Max trajectories stored
   min_size: ${rollout_batch_size}
-  train_steps_per_env_step: 2  # Train 2 times per rollout (replay ratio = 2.0)
+  train_steps_per_env_step: 1
   use_rollout_batch_size: true
   sampling_mode: "trajectory"
   storage_mode: tokens_only
   lazy_tokenization: false
 
   # Age-Based Freshness Weighting
-  # Decay formula: effective_priority = intrinsic_priority × exp(-age / age_decay)
-  # With smart eviction, we can use slightly more aggressive age decay
-  age_decay: 1500.0  # Reduced from 2000.0 for better freshness emphasis with smart eviction
+  age_decay: 500.0  # Balance between fresh and old samples
 
   # Advantage-Based Priority Update
-  # Enable two-stage priority: reward (initial) → advantage (after training)
-  use_advantage_priority: true
+  use_advantage_priority: true  # Use advantages to update priorities
 
-  # Initial Priority Function (at push time)
+  # Initial Priority Function
   priority:
-    function: reward  # Use |episode_reward| as initial priority before training
-    alpha: 0.6  # Priority exponent (0.0=uniform, 1.0=full prioritization)
-    use_importance_weights: true  # Apply importance sampling weights
-    importance_beta: 0.4  # IS weight exponent (β ∈ [0.4, 1.0])
+    function: reward  # Use reward as initial priority
+    alpha: 0.6  # Priority exponent
+    use_importance_weights: true
+    importance_beta: 0.4
 
-  # =========================================================================
-  # OFF-POLICY FILTER CONFIGURATION (New Feature)
-  # =========================================================================
-  enable_offpolicy_filter: false  # DISABLED: Can be enabled for TrajEnvManager (works fine)
-  ratio_clip_max: 3.0  # Maximum importance sampling ratio threshold
-  filter_mini_batch_size: 32  # Mini-batch size for filtering (reduces GPU memory, also the minimum size)
-  filter_max_attempts: 20  # Maximum mini-batches to try before fallback
-  filter_min_acceptable_batch: 64  # Min samples needed, otherwise supplement with unfiltered
-
-  # Adaptive Mini-Batch Configuration (自适应mini_batch_size)
-  filter_adaptive_mini_batch: true  # 启用自适应mini_batch_size调整
-  filter_success_rate_window: 5  # 滑动窗口大小：记录最近5次成功率，平滑调整
-  # 自适应策略：
-  # - 成功率≥95%: 直接设为target_batch_size (一次采样成功)
-  # - 成功率≥90%: 翻倍增长 (例如 32→64→128)
-  # - 成功率≥70%: 增长1.5倍 (例如 32→48→72)
-  # - 成功率<70%: 回退到filter_mini_batch_size (32)
-
-  # Filtering flow:
-  # 1. Sample mini-batches (32 samples each, adaptive increase) and filter
-  # 2. Early stop when collected enough valid samples (128)
-  # 3. If < 64 valid samples, supplement with unfiltered samples
-  # 4. If 0 valid samples after max_attempts, fallback to unfiltered batch
+  # ===== OFF-POLICY FILTER =====
+  # Filter samples with extreme importance sampling ratios
+  enable_offpolicy_filter: true  # Enable filtering
+  ratio_clip_max: 5.0  # Discard samples with IS ratio > 5.0
+  filter_metric: importance_ratio  # Filter based on importance sampling ratio

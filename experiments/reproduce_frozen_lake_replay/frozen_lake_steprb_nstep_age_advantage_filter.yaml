@@ -222,8 +222,6 @@ custom_envs:
 offpolicy_monitor:
   enabled: true
   save_behavior_log_probs: true
-  behavior_compute: trainer
-  behavior_scope: turn
   monitor_fresh_batch: true
   monitor_replay_batch: true
   monitor_interval: 1

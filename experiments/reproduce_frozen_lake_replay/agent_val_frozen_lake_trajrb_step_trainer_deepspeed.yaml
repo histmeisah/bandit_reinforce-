@@ -192,8 +192,6 @@ offpolicy_monitor:
 
   # Behavior policy log probs computation
   save_behavior_log_probs: true  # Compute and save after rollout
-  behavior_compute: trainer  # trainer (recompute, accurate) | engine (use inference logprobs, faster)
-  behavior_scope: turn  # turn (last assistant turn) | trajectory (full response)
 
   # Monitoring targets
   monitor_fresh_batch: true  # Monitor fresh rollout batches
