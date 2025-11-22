@@ -1,0 +1,223 @@
+defaults:
+  - ../../examples/config/traj_envs@_here_
+  - ../../examples/config/deepspeed_zero@_here_
+  - ../../examples/config/deepspeed_zero2@_here_
+  - ../../examples/config/deepspeed_zero3@_here_
+  - ../../examples/config/deepspeed_zero3_cpuoffload@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "bandit_math_reasoning"
+seed: 42
+timestamp: ${oc.env:TRAINING_TIMESTAMP,${now:%Y%m%d_%H%M%S}}
+base_output_dir: /data1/Chengyang_project/bandit_llm/experiments/bandit_math_reasoning/output
+logging_dir: ${base_output_dir}/${timestamp}/logs
+output_dir: ${base_output_dir}/${timestamp}
+render_save_dir: ${base_output_dir}/${timestamp}/render
+system_envs:
+  USE_MODELSCOPE: '1'
+
+track_with: wandb
+tracker_kwargs:
+  project: bandit-math-reasoning
+  name: ${timestamp}_bandit_traj
+  notes: "Math Reasoning with Bandit Prompt Selection"
+  tags: [agentic, roll, math_reasoning, bandit, traj_env, gsm8k]
+  mode: offline
+  dir: ${base_output_dir}/${timestamp}/wandb
+
+checkpoint_config:
+  type: file_system
+  output_dir: ${base_output_dir}/${timestamp}/models/${exp_name}
+
+# =============================================================================
+# BANDIT CONFIGURATION - 关键部分！
+# =============================================================================
+
+bandit_config:
+  # Prompt configuration
+  prompt_config_path: "configs/prompts/math_reasoning_prompts.yaml"
+  preset_name: "diverse_5"  # Use 5 diverse prompts
+
+  # Problem encoder for context embeddings
+  encoder_model: "/data1/models/pretrain/bge-base-en-v1.5"
+  context_dim: 768  # bge-base-en-v1.5 outputs 768-dim embeddings
+
+  # NeuralUCB parameters
+  hidden_dims: [512, 256]  # 增大隐藏层以匹配更大的输入维度
+  exploration_param: 1.0
+  learning_rate: 0.001
+  reg_param: 1.0
+  buffer_size: 10000
+  batch_size: 32
+  update_freq: 10
+
+  # Monitoring
+  enable_monitoring: true
+
+# =============================================================================
+# TRAINING CONFIGURATION
+# =============================================================================
+
+num_gpus_per_node: 8
+max_steps: 500
+save_steps: 10000
+logging_steps: 1
+eval_steps: 20
+resume_from_checkpoint: false
+train_from_replay_only: false
+batch_adjust_mode: auto
+async_generation_ratio: 1
+
+rollout_batch_size: 16  # 减小到16以节省显存
+val_batch_size: 8  # 减小到8
+sequence_length: 2048
+
+advantage_clip: 20
+ppo_epochs: 1
+adv_estimator: "reinforce"
+init_kl_coef: 0.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+# =============================================================================
+# MODEL CONFIGURATION
+# =============================================================================
+pretrain: /data1/models/pretrain/Qwen2.5-3B-Instruct
+reward_pretrain: /data1/models/pretrain/Qwen2.5-3B-Instruct
+
+
+actor_train:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 5.0e-7
+    weight_decay: 0
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 4  # 减小到4以节省显存
+    warmup_steps: 10
+    lr_scheduler_type: cosine
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero3}
+  device_mapping: list(range(0,4))
+  infer_batch_size: 1
+
+actor_infer:
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: ${max_tokens_per_step}
+    top_p: 0.9
+    top_k: 50
+    num_beams: 1
+    temperature: 0.8
+    num_return_sequences: 1
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.8
+      block_size: 16
+      load_format: auto
+  device_mapping: list(range(4,8))
+
+reference:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: hf_infer
+    strategy_config: ~
+  device_mapping: list(range(0,4))
+  infer_batch_size: 1
+
+# =============================================================================
+# ENVIRONMENT CONFIGURATION
+# =============================================================================
+
+max_tokens_per_step: 1024
+max_actions_per_traj: 1
+
+reward_normalization:
+  grouping: batch
+  method: identity
+
+train_env_manager:
+  format_penalty: 0.0
+  max_env_num_per_worker: 4  # 减小到4
+  num_env_groups: 8  # 减小到8
+  group_size: 2
+  tags: [MathBandit]
+  num_groups_partition: [8]  # 对应调整
+
+val_env_manager:
+  max_env_num_per_worker: 4  # 减小到4
+  num_env_groups: 4  # 减小到4
+  group_size: 2
+  tags: [MathBanditVal]
+  num_groups_partition: [4]  # 对应调整
+
+custom_envs:
+  MathBandit:
+    env_type: math_reasoning_bandit
+    max_tokens_per_step: ${max_tokens_per_step}
+    agent_system_template: "You are an expert mathematician. Solve problems step by step."
+    agent_template: "{state}"
+    reward_template: ""
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    env_config:
+      dataset_name: "gsm8k"
+      dataset_split: "train"
+      dataset_seed: 42
+      dataset_path: "/data1/Chengyang_project/bandit_llm/data/gsm8k/train.jsonl"
+      max_steps: 1
+      reward_correct: 1.0
+      reward_incorrect: 0.0
+      reward_partial: 0.5
+      enable_numerical_matching: true
+      numerical_tolerance: 0.001
+      enable_partial_matching: true
+
+  MathBanditVal:
+    env_type: math_reasoning_bandit
+    max_tokens_per_step: ${max_tokens_per_step}
+    agent_system_template: "You are an expert mathematician. Solve problems step by step."
+    agent_template: "{state}"
+    reward_template: ""
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    env_config:
+      dataset_name: "gsm8k"
+      dataset_split: "test"
+      dataset_seed: 42
+      dataset_path: "/data1/Chengyang_project/bandit_llm/data/gsm8k/test.jsonl"
+      max_steps: 1
+      reward_correct: 1.0
+      reward_incorrect: 0.0
+      reward_partial: 0.5
+      enable_numerical_matching: true
+      numerical_tolerance: 0.001
+      enable_partial_matching: true
+
+offpolicy_monitor:
+  enabled: false
+
+replay:
+  enabled: false
