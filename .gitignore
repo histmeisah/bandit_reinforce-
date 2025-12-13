@@ -5,3 +5,9 @@ output/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Exclude experiment data and outputs
+experiments/bandit_math_reasoning/
+
+# Exclude Claude config
+.claude/
