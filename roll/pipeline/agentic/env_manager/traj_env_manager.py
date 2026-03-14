@@ -208,6 +208,9 @@ class TrajEnvManager(BaseEnvManager):
                              self.pipeline_config.sequence_length-input_ids.shape[1])
         generation_config = self.worker_config.generating_args.to_dict()
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
+        # Enable engine logprobs when replay buffer is active (needed for behavior_log_probs)
+        if self.mode == "train" and getattr(self.pipeline_config, 'replay', None) and self.pipeline_config.replay.enabled:
+            generation_config["logprobs"] = 1
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
 
         input_messages = [item for items in self.rollout_cache.history for item in items["messages"]]

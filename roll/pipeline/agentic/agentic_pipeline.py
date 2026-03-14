@@ -18,7 +18,7 @@ from roll.distributed.scheduler.router import RouterManager
 from roll.distributed.scheduler.rollout_scheduler import RolloutScheduler
 from roll.configs.base_config import RouterArguments
 from roll.models.model_providers import default_tokenizer_provider
-from roll.pipeline.agentic.agentic_config import AgenticConfig, EnvManagerConfig
+from roll.pipeline.agentic.agentic_config import AgenticConfig, EnvManagerConfig, ReplayConfig
 from roll.pipeline.agentic.utils import (
     agentic_compute_advantage,
     compute_discounted_returns,
@@ -204,6 +204,27 @@ class AgenticPipeline(BasePipeline):
         else:
             self.partial_gpu_mode = False
 
+        # INIT PHASE: Initialize Replay Buffer (FreshPER)
+        self.replay_buffer = None
+        replay_cfg: ReplayConfig = getattr(self.pipeline_config, 'replay', None)
+        if replay_cfg and replay_cfg.enabled:
+            from roll.pipeline.agentic.replay_buffer import create_replay_buffer
+            manager_type = replay_cfg.sampling_mode
+            self.replay_buffer = create_replay_buffer(
+                manager_type=manager_type,
+                capacity=replay_cfg.capacity,
+                batch_size=self.pipeline_config.rollout_batch_size,
+                priority_function=replay_cfg.priority_function,
+                priority_exponent=replay_cfg.priority_exponent,
+                enable_age_decay=replay_cfg.enable_age_decay,
+                age_decay=replay_cfg.age_decay,
+                eviction_strategy=replay_cfg.eviction_strategy,
+            )
+            logger.info(
+                f"Replay buffer initialized: type={manager_type}, capacity={replay_cfg.capacity}, "
+                f"priority={replay_cfg.priority_function}, train_steps={replay_cfg.train_steps_per_env_step}"
+            )
+
     @torch.no_grad()
     def run(self):
         # Calculate tokens-per-second system throughput
@@ -337,6 +358,10 @@ class AgenticPipeline(BasePipeline):
                             logger.info(f"Shrink sampler: {shrink_metrics}")
                             metrics.update({"shrink/" + k: v for k, v in shrink_metrics.items()})
                         metrics["time/step_shrink"] = shrink_timer.last
+
+                    # REPLAY BUFFER: Store fresh batch before training
+                    if self.replay_buffer is not None:
+                        self._store_to_replay_buffer(batch, global_step)
 
                     batch = compute_discounted_returns(batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
 
@@ -502,6 +527,11 @@ class AgenticPipeline(BasePipeline):
                             metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
                         tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
                     metrics["time/step_train"] = train_timer.last
+
+                    # REPLAY BUFFER: Additional off-policy training iterations
+                    if self.replay_buffer is not None:
+                        replay_metrics = self._replay_training_loop(batch, global_step, metrics)
+                        metrics.update(replay_metrics)
 
                 with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer:
                     data_metrics = compute_train_data_metrics(batch=batch)
@@ -869,6 +899,223 @@ class AgenticPipeline(BasePipeline):
                 f"infer_devices={sorted(infer_devices_list)}, freed_gpus={sorted(freed_gpu_list)}, "
                 f"gpus_per_rank={gpus_per_dp_rank}"
             )
+
+    def _store_to_replay_buffer(self, batch: DataProto, global_step: int) -> None:
+        """Store fresh batch into replay buffer with infer_logprobs as behavior_log_probs."""
+        replay_cfg = self.pipeline_config.replay
+
+        # Use infer_logprobs as behavior_log_probs for off-policy analysis
+        if "infer_logprobs" in batch.batch:
+            batch.batch["behavior_log_probs"] = batch.batch["infer_logprobs"].clone()
+        else:
+            logger.warning(
+                "No infer_logprobs in batch. Replay buffer will store zeros as behavior_log_probs. "
+                "Ensure generation_config has logprobs=1 when replay is enabled."
+            )
+
+        self.replay_buffer.push_from_dataproto(batch, global_step)
+        stats = self.replay_buffer.get_stats()
+        logger.debug(
+            f"Replay buffer: stored batch at step {global_step}, "
+            f"size={stats.get('current_size', stats.get('total_stored', 0))}/{replay_cfg.capacity}"
+        )
+
+    def _replay_training_loop(self, fresh_batch: DataProto, global_step: int, metrics: Dict) -> Dict:
+        """Execute additional off-policy training iterations from replay buffer.
+
+        The first training iteration (on fresh data) is already done in the main loop.
+        This method handles iterations 2..train_steps_per_env_step using replay buffer samples.
+
+        Args:
+            fresh_batch: The fresh on-policy batch (for reference, not retrained)
+            global_step: Current global step
+            metrics: Metrics dict to update with replay stats
+
+        Returns:
+            Dictionary of replay-specific metrics
+        """
+        replay_cfg = self.pipeline_config.replay
+        replay_metrics: Dict[str, float] = {}
+
+        # Log buffer stats
+        stats = self.replay_buffer.get_stats()
+        replay_metrics["replay/buffer_size"] = float(stats.get("current_size", stats.get("total_stored", 0)))
+        replay_metrics["replay/buffer_utilization"] = float(stats.get("utilization", 0.0))
+
+        # Check if buffer has enough data
+        min_size = replay_cfg.min_size
+        if not self.replay_buffer.can_sample(min_size):
+            logger.info(
+                f"Replay buffer too small for sampling ({stats.get('current_size', 0)} < {min_size}), "
+                f"skipping replay training iterations."
+            )
+            return replay_metrics
+
+        # Additional training iterations (iteration 0 was the fresh on-policy step)
+        num_replay_steps = replay_cfg.train_steps_per_env_step - 1
+        if num_replay_steps <= 0:
+            return replay_metrics
+
+        with Timer(name="replay_train", logger=None) as replay_timer:
+            for replay_iter in range(num_replay_steps):
+                iter_metrics = self._single_replay_train_step(global_step, replay_iter, replay_cfg)
+                # Prefix with iteration number
+                for k, v in iter_metrics.items():
+                    replay_metrics[f"replay/iter{replay_iter + 1}/{k}"] = v
+
+        replay_metrics["time/replay_train"] = replay_timer.last
+        replay_metrics["replay/num_replay_steps"] = float(num_replay_steps)
+
+        return replay_metrics
+
+    def _single_replay_train_step(
+        self, global_step: int, replay_iter: int, replay_cfg: ReplayConfig
+    ) -> Dict[str, float]:
+        """Execute a single off-policy training step from replay buffer.
+
+        Samples from buffer, recomputes rewards/advantages/log_probs with current policy,
+        then runs actor (and optionally critic) training.
+
+        Args:
+            global_step: Current global step
+            replay_iter: Replay iteration index (0-based, for logging)
+            replay_cfg: Replay configuration
+
+        Returns:
+            Metrics from this replay training step
+        """
+        iter_metrics: Dict[str, float] = {}
+
+        # Sample from replay buffer
+        result = self.replay_buffer.sample_for_training(
+            batch_size=self.pipeline_config.rollout_batch_size,
+            device='cpu',
+            tokenizer=self.tokenizer,
+            sequence_length=self.pipeline_config.sequence_length,
+            compute_importance_weights=replay_cfg.importance_sampling_correction,
+            importance_weight_beta=replay_cfg.importance_beta,
+        )
+        if result is None or result[0] is None:
+            logger.warning(f"Replay buffer sampling returned None at step {global_step}, iter {replay_iter}")
+            return iter_metrics
+
+        replay_batch, sampled_indices = result
+
+        # Set meta_info for the replay batch
+        replay_batch.meta_info["global_step"] = global_step
+        replay_batch.meta_info["_broadcast_non_tensor_batch"] = True
+        replay_batch.meta_info["loss_mask_keys"] = ["response_mask"]
+        replay_batch.meta_info["from_replay_buffer"] = True
+
+        # Compute discounted returns
+        replay_batch = compute_discounted_returns(
+            replay_batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma
+        )
+
+        # Adjust batch size for divisibility
+        replay_batch = self.adjust_batch(replay_batch, mode=self.pipeline_config.batch_adjust_mode)
+
+        # Recompute ref_log_probs with current reference model
+        if self.pipeline_config.enable_reference:
+            worker_config = self.pipeline_config.reference if self.use_ref_model else self.pipeline_config.actor_train
+            worker = self.reference if self.use_ref_model else self.actor_train
+            if not self.use_ref_model:
+                replay_batch.meta_info["disable_adapter"] = True
+                replay_batch.meta_info["is_offload_states"] = False
+            batch_balance(replay_batch, dp_size=worker.dp_size, minibatch_size=len(replay_batch))
+            ref_lp_refs = worker.compute_log_probs(replay_batch, blocking=False)
+            ref_lp = DataProto.materialize_concat(data_refs=ref_lp_refs)
+            ref_lp.rename(old_keys="log_probs", new_keys="ref_log_probs")
+            replay_batch = replay_batch.union(ref_lp)
+        else:
+            # Will be mocked from old_log_probs below
+            pass
+
+        # Recompute old_log_probs with current policy
+        if self.pipeline_config.enable_reference and not self.use_ref_model:
+            replay_batch.meta_info["disable_adapter"] = False
+        replay_batch.meta_info["is_offload_states"] = False
+
+        batch_balance(replay_batch, dp_size=self.actor_train.dp_size, minibatch_size=len(replay_batch))
+        old_lp: DataProto = self.actor_train.compute_log_probs(replay_batch, blocking=True)
+        replay_batch.batch["old_log_probs"] = old_lp.batch["log_probs"]
+
+        # Mock ref_log_probs if reference disabled
+        if not self.pipeline_config.enable_reference:
+            replay_batch.batch["ref_log_probs"] = replay_batch.batch["old_log_probs"].clone()
+
+        # Compute response-level mask
+        replay_batch, _ = get_agentic_response_level_mask(replay_batch, self.pipeline_config)
+
+        # Compute rewards and advantages
+        # For replay batches, override reward normalization grouping to "batch" level.
+        # Reason: on-policy uses traj_group_id grouping (each group has group_size trajectories
+        # from the same prompt), but replay sampling breaks group structure - each traj_group_id
+        # likely has only 1 trajectory, causing mean_std normalization to produce all-zero rewards.
+        original_grouping = self.pipeline_config.reward_normalization.grouping
+        if self.pipeline_config.reward_normalization.grouping != "batch":
+            self.pipeline_config.reward_normalization.grouping = "batch"
+        replay_batch, reward_metrics = compute_response_level_rewards(
+            batch=replay_batch, pipeline_config=self.pipeline_config
+        )
+        self.pipeline_config.reward_normalization.grouping = original_grouping
+        replay_batch, token_level_metrics = compute_token_reward(replay_batch, self.pipeline_config, self.kl_ctrl)
+
+        replay_batch = agentic_compute_advantage(
+            data=replay_batch,
+            gamma=self.pipeline_config.gamma,
+            lambd=self.pipeline_config.lambd,
+            adv_estimator=self.pipeline_config.adv_estimator,
+            advantage_clip=self.pipeline_config.advantage_clip,
+            whiten_advantages=self.pipeline_config.whiten_advantages,
+            whiten_rewards=self.pipeline_config.whiten_rewards,
+            pipeline_config=self.pipeline_config,
+        )
+
+        # Apply train-infer correction
+        if self.pipeline_config.enable_old_logprobs_recompute:
+            replay_batch, _ = apply_train_infer_correction_to_batch(
+                self.pipeline_config, replay_batch,
+                update_mask_keys=replay_batch.meta_info['loss_mask_keys']
+            )
+
+        # Actor training step
+        actor_train_metrics = None
+        if self.pipeline_config.critic_warmup <= global_step:
+            batch_balance(
+                replay_batch, dp_size=self.actor_train.dp_size,
+                minibatch_size=self.actor_train.dp_size
+                * self.pipeline_config.actor_train.training_args.per_device_train_batch_size
+                * self.pipeline_config.actor_train.training_args.gradient_accumulation_steps,
+            )
+            actor_refs = self.actor_train.train_step(replay_batch, blocking=False)
+            actor_train_metrics = DataProto.materialize_concat(data_refs=actor_refs)
+            iter_metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
+
+        # Off-policy monitoring
+        offpolicy_monitor_cfg = getattr(self.pipeline_config, 'offpolicy_monitor', None)
+        if offpolicy_monitor_cfg and offpolicy_monitor_cfg.enabled:
+            if global_step % offpolicy_monitor_cfg.monitor_interval == 0:
+                from roll.pipeline.agentic.offpolicy_monitor import compute_offpolicy_metrics
+                offpolicy_metrics = compute_offpolicy_metrics(
+                    current_batch=replay_batch,
+                    training_metrics=actor_train_metrics,
+                    pg_clip=getattr(self.pipeline_config, 'pg_clip', None),
+                )
+                iter_metrics.update(offpolicy_metrics)
+
+        # Compute average age of sampled data
+        if sampled_indices:
+            ages = []
+            for idx in sampled_indices:
+                entry = self.replay_buffer.trajectories[idx] if hasattr(self.replay_buffer, 'trajectories') else None
+                if entry and hasattr(entry, 'stored_at_step'):
+                    ages.append(global_step - entry.stored_at_step)
+            if ages:
+                iter_metrics["avg_sample_age"] = float(np.mean(ages))
+
+        return iter_metrics
+
 
 def get_episode_scores(batch: DataProto) -> torch.Tensor:
     batch_group_by_traj: Dict[str, DataProto] = batch.group_by(keys="traj_id")

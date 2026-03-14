@@ -183,6 +183,38 @@ class EnvMonitorConfig:
 
 
 @dataclass
+class ReplayConfig:
+    """Off-policy replay buffer configuration for FreshPER."""
+    enabled: bool = field(default=False, metadata={"help": "Enable replay buffer for off-policy training."})
+    capacity: int = field(default=100000, metadata={"help": "Maximum number of entries in the replay buffer."})
+    min_size: int = field(default=128, metadata={"help": "Minimum buffer size before sampling is allowed."})
+    train_steps_per_env_step: int = field(
+        default=2, metadata={"help": "Number of training iterations per environment step. "
+                                     "First uses fresh batch (on-policy), rest sample from buffer."}
+    )
+    sampling_mode: str = field(default="trajectory", metadata={"help": "Sampling mode: 'trajectory' or 'step'."})
+    eviction_strategy: str = field(default="fifo", metadata={"help": "Eviction strategy: 'fifo' or 'priority'."})
+    # FreshPER priority
+    priority_function: str = field(
+        default="reward_fresh",
+        metadata={"help": "Priority function name. See replay_buffer/priority_functions.py for options."}
+    )
+    priority_exponent: float = field(default=0.6, metadata={"help": "Exponent alpha for priority sampling P(i) ~ p_i^alpha."})
+    enable_age_decay: bool = field(default=True, metadata={"help": "Enable exponential age decay in priority."})
+    age_decay: float = field(default=1000.0, metadata={"help": "Age decay half-life parameter tau. priority *= exp(-age/tau)."})
+    # Importance sampling correction
+    importance_sampling_correction: bool = field(default=False, metadata={"help": "Enable IS correction for off-policy updates."})
+    importance_beta: float = field(default=0.4, metadata={"help": "Beta for importance sampling weight annealing."})
+
+
+@dataclass
+class OffPolicyMonitorConfig:
+    """Off-policy diagnostics monitoring configuration."""
+    enabled: bool = field(default=False, metadata={"help": "Enable off-policy monitoring metrics."})
+    monitor_interval: int = field(default=1, metadata={"help": "Log off-policy metrics every N training steps."})
+
+
+@dataclass
 class AgenticConfig(PPOConfig):
     # agentic related
     custom_envs: Dict[str, Any] = field(default_factory=dict, metadata={"help": "List of environment configurations."})
@@ -229,6 +261,12 @@ class AgenticConfig(PPOConfig):
         metadata={
             "help": "Set to True when chat template will not add system prompt automatically if not present in messages, e.g. Qwen3.5 series."
         }
+    )
+
+    # FreshPER: Off-policy replay buffer and monitoring
+    replay: ReplayConfig = field(default_factory=ReplayConfig, metadata={"help": "Replay buffer configuration."})
+    offpolicy_monitor: OffPolicyMonitorConfig = field(
+        default_factory=OffPolicyMonitorConfig, metadata={"help": "Off-policy monitoring configuration."}
     )
 
     def __post_init__(self):
