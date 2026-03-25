@@ -269,6 +269,13 @@ class AgenticConfig(PPOConfig):
         default_factory=OffPolicyMonitorConfig, metadata={"help": "Off-policy monitoring configuration."}
     )
 
+    # Bandit REINFORCE++: Contextual bandit for adaptive prompt selection
+    bandit_config: Optional[Dict[str, Any]] = field(
+        default=None,
+        metadata={"help": "Bandit configuration for adaptive prompt selection. "
+                          "Keys: preset, encoder_model, exploration_param, hidden_dims, etc."}
+    )
+
     def __post_init__(self):
         # Handle OPD mapping FIRST before any access to actor_train/actor_infer/reference
         # This ensures student_train/student_infer/teacher are mapped correctly

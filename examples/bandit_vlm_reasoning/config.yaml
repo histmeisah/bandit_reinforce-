@@ -1,0 +1,180 @@
+defaults:
+  - ../config/traj_envs_gem_math@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "bandit_vlm_reasoning"
+seed: 42
+logging_dir: ./output/logs
+output_dir: ./output
+
+track_with: tensorboard
+tracker_kwargs:
+  log_dir: ./output/tensorboard/${exp_name}
+
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/models/${exp_name}
+
+num_gpus_per_node: 8
+
+max_steps: 1024
+save_steps: 10000
+logging_steps: 1
+eval_steps: 10
+resume_from_checkpoint: false
+
+rollout_batch_size: 128
+val_batch_size: 128
+sequence_length: 8192
+
+advantage_clip: 20
+ppo_epochs: 1
+adv_estimator: "reinforce"
+
+init_kl_coef: 0.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+# VLM model for training
+pretrain: Qwen/Qwen2.5-VL-7B-Instruct
+reward_pretrain: Qwen/Qwen2.5-VL-7B-Instruct
+
+# Use BanditAgenticPipeline
+pipeline_cls: roll.pipeline.agentic.bandit_agentic_pipeline.BanditAgenticPipeline
+
+actor_train:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 8
+    warmup_steps: 0
+    warmup_ratio: 0
+    lr_scheduler_type: constant
+  strategy_args:
+    strategy_name: megatron_train
+    strategy_config:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 1
+      use_distributed_optimizer: true
+      recompute_granularity: full
+  device_mapping: list(range(0,8))
+  infer_batch_size: 2
+
+actor_infer:
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: ${max_tokens_per_step}
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.99
+    num_return_sequences: 1
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.8
+      block_size: 16
+      load_format: auto
+      limit_mm_per_prompt:
+        image: ${max_actions_per_traj}
+  device_mapping: list(range(0,8))
+
+reference:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+  strategy_args:
+    strategy_name: hf_infer
+    strategy_config: ~
+  device_mapping: list(range(0,8))
+  infer_batch_size: 2
+
+reward_normalization:
+  grouping: batch
+  method: identity
+
+train_env_manager:
+  max_env_num_per_worker: 16
+  num_env_groups: 128
+  group_size: 1
+  tags: [bandit_vlm_math]
+  num_groups_partition: [128]
+
+val_env_manager:
+  max_env_num_per_worker: 32
+  num_env_groups: 128
+  group_size: 1
+  tags: [bandit_vlm_math]
+  num_groups_partition: [128]
+
+max_tokens_per_step: 4096
+
+math_agent_system_template: Please reason step by step, and put your final answer within '\boxed{}', e.g. \boxed{{A}}..
+math_agent_template: "{observation}\nEnsure that your response includes the format of '\\boxed{{answer}}', e.g. \\boxed{{A}}."
+
+custom_envs:
+  bandit_vlm_math:
+    env_type: "roll_math_bandit"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: ${math_agent_system_template}
+    agent_template: ${math_agent_template}
+    env_config:
+      dataset_name: open-r1/DAPO-Math-17k-Processed
+      question_key: prompt
+      answer_key: solution
+      bandit_config: {}
+
+# Bandit REINFORCE++ with Qwen3-VL-Embedding (multimodal encoder)
+bandit_config:
+  preset: diverse_5
+  bandit_algorithm: ts
+  # Multimodal encoder: text + image + video unified embedding
+  encoder_type: qwen3_vl
+  encoder_model: Qwen/Qwen3-VL-Embedding-2B
+  encoder_device: cpu
+  embedding_dim: 512  # truncate to 512 for bandit efficiency (MRL supported)
+  exploration_param: 1.0
+  hidden_dims: [256, 128]
+  learning_rate: 0.001
+  reg_param: 1.0
+  l2_weight: 0.01
+  buffer_size: 10000
+  batch_size: 32
+  update_freq: 10
+
+# FreshPER replay buffer
+replay:
+  enabled: true
+  capacity: 100000
+  min_size: 128
+  train_steps_per_env_step: 2
+  sampling_mode: trajectory
+  eviction_strategy: fifo
+  priority_function: reward_fresh
+  priority_exponent: 0.6
+  enable_age_decay: true
+  age_decay: 1000.0
+  importance_sampling_correction: false
+  importance_beta: 0.4
+
+offpolicy_monitor:
+  enabled: true
+  monitor_interval: 1
