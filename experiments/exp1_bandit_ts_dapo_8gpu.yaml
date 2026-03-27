@@ -1,0 +1,168 @@
+defaults:
+  - ../ROLL/examples/config/traj_envs_gem_math@_here_
+  - ../ROLL/examples/config/deepspeed_zero2@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+# ============================================================================
+# Experiment 1: Bandit(Thompson Sampling) + REINFORCE++
+# FULL RUN: 8 GPU A100
+# ============================================================================
+
+exp_name: "exp1_bandit_ts_dapo_8gpu"
+seed: 42
+logging_dir: /ibex/user/maw0a/python_project/bandit_reinforce/output/logs
+output_dir: /ibex/user/maw0a/python_project/bandit_reinforce/output
+
+track_with: wandb
+tracker_kwargs:
+  project: bandit-reinforce-pp
+  name: ${exp_name}
+  notes: "Bandit(TS) + REINFORCE++ on DAPO-17k, Qwen3-4B-Base, 8GPU"
+  tags: [bandit, thompson_sampling, reinforce++, dapo_17k, 8gpu]
+
+checkpoint_config:
+  type: file_system
+  output_dir: /ibex/user/maw0a/python_project/bandit_reinforce/output/models/${exp_name}
+
+num_gpus_per_node: 8
+
+max_steps: 200
+save_steps: 50
+logging_steps: 1
+eval_steps: 20
+resume_from_checkpoint: false
+
+# 8 GPU: scale batch proportionally (2GPU=16 -> 8GPU=64)
+rollout_batch_size: 64
+val_batch_size: 64
+sequence_length: 4096
+
+advantage_clip: 20
+ppo_epochs: 1
+adv_estimator: "reinforce"
+
+init_kl_coef: 0.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+# Local model path on server
+pretrain: /ibex/user/maw0a/python_project/models/Qwen3-4B-Base
+reward_pretrain: /ibex/user/maw0a/python_project/models/Qwen3-4B-Base
+
+pipeline_cls: roll.pipeline.agentic.bandit_agentic_pipeline.BanditAgenticPipeline
+
+actor_train:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 4
+    warmup_steps: 0
+    warmup_ratio: 0
+    lr_scheduler_type: constant
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero2}
+  device_mapping: list(range(0,8))
+  infer_batch_size: 2
+
+actor_infer:
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: ${max_tokens_per_step}
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.99
+    num_return_sequences: 1
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.8
+      block_size: 16
+      load_format: auto
+  device_mapping: list(range(0,8))
+
+reference:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+  strategy_args:
+    strategy_name: hf_infer
+    strategy_config: ~
+  device_mapping: list(range(0,8))
+  infer_batch_size: 2
+
+reward_normalization:
+  grouping: batch
+  method: identity
+
+train_env_manager:
+  max_env_num_per_worker: 64
+  num_env_groups: 64
+  group_size: 1
+  tags: [bandit_math]
+  num_groups_partition: [64]
+
+val_env_manager:
+  max_env_num_per_worker: 64
+  num_env_groups: 64
+  group_size: 1
+  tags: [bandit_math]
+  num_groups_partition: [64]
+
+max_tokens_per_step: 2048
+
+math_agent_system_template: "Please reason step by step, and put your final answer within '\\boxed{}', e.g. \\boxed{{A}}."
+math_agent_template: "{observation}\nEnsure that your response includes the format of '\\boxed{{answer}}', e.g. \\boxed{{A}}."
+
+custom_envs:
+  bandit_math:
+    env_type: "roll_math_bandit"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: ${math_agent_system_template}
+    agent_template: ${math_agent_template}
+    env_config:
+      dataset_name: /ibex/user/maw0a/python_project/bandit_reinforce/ROLL/data/dapo_math_17k.jsonl
+      split: train
+      question_key: prompt
+      answer_key: solution
+      bandit_config: {}
+
+bandit_config:
+  preset: diverse_5
+  bandit_algorithm: ts
+  encoder_type: transformers
+  encoder_model: /ibex/user/maw0a/python_project/models/Qwen3-Embedding-0.6B
+  encoder_device: cpu
+  embedding_dim: 512
+  exploration_param: 1.0
+  hidden_dims: [256, 128]
+  learning_rate: 0.001
+  reg_param: 1.0
+  l2_weight: 0.01
+  buffer_size: 10000
+  batch_size: 32
+  update_freq: 10
+
+replay:
+  enabled: false
+
+offpolicy_monitor:
+  enabled: false

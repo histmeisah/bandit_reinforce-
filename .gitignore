@@ -1,13 +1,53 @@
-nul
-nul
+# Output and logs
 output/
+dcgm/
 *.log
+
+# Models (too large for git)
+models/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.so
 .pytest_cache/
+
+# Environment
+.env
+*.lock
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Wandb
+wandb/
+
+# Ray
+/tmp/ray/
+
+# Debug logs
+experiments/debug_log/
 
 # Exclude experiment data and outputs
 experiments/bandit_math_reasoning/
 
-# Exclude Claude config
+# Claude config
 .claude/
+
+# ROLL build artifacts
+ROLL/*.egg-info/
+ROLL/build/
+ROLL/dist/
+ROLL/output/
+
+# Backup
+ROLL_backup/
