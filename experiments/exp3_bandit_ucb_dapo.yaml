@@ -14,19 +14,19 @@ hydra:
 
 exp_name: "exp3_bandit_ucb_dapo_debug"
 seed: 42
-logging_dir: /ibex/user/maw0a/python_project/bandit_reinforce/output/logs
-output_dir: /ibex/user/maw0a/python_project/bandit_reinforce/output
+logging_dir: /mnt/project_modelware/zhaojian/weiyu/bandit_reinforce/output/logs
+output_dir: /mnt/project_modelware/zhaojian/weiyu/bandit_reinforce/output
 
 track_with: wandb
 tracker_kwargs:
   project: bandit-reinforce-pp
   name: ${exp_name}
-  notes: "Bandit(UCB) + REINFORCE++ on DAPO-17k, Qwen3-4B-Base, 2GPU debug"
-  tags: [bandit, ucb, reinforce++, dapo_17k, debug]
+  notes: "Bandit(UCB) + REINFORCE++ on DAPO-17k, Qwen3-8B-Base, 2GPU debug"
+  tags: [bandit, ucb, reinforce++, dapo_17k, qwen3_8b, debug]
 
 checkpoint_config:
   type: file_system
-  output_dir: /ibex/user/maw0a/python_project/bandit_reinforce/output/models/${exp_name}
+  output_dir: /mnt/project_modelware/zhaojian/weiyu/bandit_reinforce/output/models/${exp_name}
 
 num_gpus_per_node: 2
 
@@ -49,8 +49,8 @@ whiten_advantages: true
 entropy_loss_coef: 0
 max_grad_norm: 1.0
 
-pretrain: /ibex/user/maw0a/python_project/models/Qwen3-4B-Base
-reward_pretrain: /ibex/user/maw0a/python_project/models/Qwen3-4B-Base
+pretrain: /mnt/project_modelware/zhaojian/models/pretrain/Qwen3-8B-Base
+reward_pretrain: /mnt/project_modelware/zhaojian/models/pretrain/Qwen3-8B-Base
 
 pipeline_cls: roll.pipeline.agentic.bandit_agentic_pipeline.BanditAgenticPipeline
 
@@ -133,11 +133,12 @@ custom_envs:
     env_type: "roll_math_bandit"
     max_steps: ${max_actions_per_traj}
     max_tokens_per_step: ${max_tokens_per_step}
+    reward_template: ""
     env_manager_cls: ${env_manager_cls}
     agent_system_template: ${math_agent_system_template}
     agent_template: ${math_agent_template}
     env_config:
-      dataset_name: /ibex/user/maw0a/python_project/bandit_reinforce/ROLL/data/dapo_math_17k.jsonl
+      dataset_name: /mnt/project_modelware/zhaojian/weiyu/bandit_reinforce/bandit_reinforce-/ROLL/data/dapo_math_17k.jsonl
       split: train
       question_key: prompt
       answer_key: solution
@@ -148,7 +149,7 @@ bandit_config:
   preset: diverse_5
   bandit_algorithm: ucb
   encoder_type: transformers
-  encoder_model: /ibex/user/maw0a/python_project/models/Qwen3-Embedding-0.6B
+  encoder_model: /mnt/project_modelware/zhaojian/models/pretrain/Qwen3-Embedding-0.6B
   encoder_device: cpu
   embedding_dim: 512
   exploration_param: 1.0

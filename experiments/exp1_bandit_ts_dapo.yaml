@@ -14,33 +14,33 @@ hydra:
 
 exp_name: "exp1_bandit_ts_dapo_debug"
 seed: 42
-logging_dir: /ibex/user/maw0a/python_project/bandit_reinforce/output/logs
-output_dir: /ibex/user/maw0a/python_project/bandit_reinforce/output
+logging_dir: /mnt/project_modelware/zhaojian/weiyu/bandit_reinforce/output/logs
+output_dir: /mnt/project_modelware/zhaojian/weiyu/bandit_reinforce/output
 
 track_with: wandb
 tracker_kwargs:
   project: bandit-reinforce-pp
   name: ${exp_name}
-  notes: "Bandit(TS) + REINFORCE++ on DAPO-17k, Qwen3-4B-Base, 2GPU debug"
-  tags: [bandit, thompson_sampling, reinforce++, dapo_17k, debug]
+  notes: "Bandit(TS) + REINFORCE++ on DAPO-17k, Qwen3-8B-Base, 2GPU debug"
+  tags: [bandit, thompson_sampling, reinforce++, dapo_17k, qwen3_8b, debug]
 
 checkpoint_config:
   type: file_system
-  output_dir: /ibex/user/maw0a/python_project/bandit_reinforce/output/models/${exp_name}
+  output_dir: /mnt/project_modelware/zhaojian/weiyu/bandit_reinforce/output/models/${exp_name}
 
 num_gpus_per_node: 2
 
 # Debug: small steps
-max_steps: 10
+max_steps: 200
 save_steps: 100
 logging_steps: 1
 eval_steps: 5
 resume_from_checkpoint: false
 
-# Debug: small batch
-rollout_batch_size: 16
-val_batch_size: 16
-sequence_length: 4096
+# Debug: small batch (single GPU per role, 80GB A100)
+rollout_batch_size: 8
+val_batch_size: 8
+sequence_length: 2048
 
 advantage_clip: 20
 ppo_epochs: 1
@@ -52,8 +52,8 @@ entropy_loss_coef: 0
 max_grad_norm: 1.0
 
 # Local model path on server
-pretrain: /ibex/user/maw0a/python_project/models/Qwen3-4B-Base
-reward_pretrain: /ibex/user/maw0a/python_project/models/Qwen3-4B-Base
+pretrain: /mnt/project_modelware/zhaojian/models/pretrain/Qwen2.5-1.5B
+reward_pretrain: /mnt/project_modelware/zhaojian/models/pretrain/Qwen2.5-1.5B
 
 pipeline_cls: roll.pipeline.agentic.bandit_agentic_pipeline.BanditAgenticPipeline
 
@@ -74,7 +74,7 @@ actor_train:
   strategy_args:
     strategy_name: deepspeed_train
     strategy_config: ${deepspeed_zero2}
-  device_mapping: list(range(0,2))
+  device_mapping: "[0]"
   infer_batch_size: 2
 
 actor_infer:
@@ -94,7 +94,10 @@ actor_infer:
       gpu_memory_utilization: 0.8
       block_size: 16
       load_format: auto
-  device_mapping: list(range(0,2))
+      max_model_len: 2048
+      enforce_eager: true
+      VLLM_USE_V1: 0
+  device_mapping: "[1]"
 
 reference:
   model_args:
@@ -105,7 +108,7 @@ reference:
   strategy_args:
     strategy_name: hf_infer
     strategy_config: ~
-  device_mapping: list(range(0,2))
+  device_mapping: "[1]"
   infer_batch_size: 2
 
 reward_normalization:
@@ -113,20 +116,20 @@ reward_normalization:
   method: identity
 
 train_env_manager:
-  max_env_num_per_worker: 16
-  num_env_groups: 16
+  max_env_num_per_worker: 8
+  num_env_groups: 8
   group_size: 1
   tags: [bandit_math]
-  num_groups_partition: [16]
+  num_groups_partition: [8]
 
 val_env_manager:
-  max_env_num_per_worker: 16
-  num_env_groups: 16
+  max_env_num_per_worker: 8
+  num_env_groups: 8
   group_size: 1
   tags: [bandit_math]
-  num_groups_partition: [16]
+  num_groups_partition: [8]
 
-max_tokens_per_step: 2048
+max_tokens_per_step: 1024
 
 math_agent_system_template: "Please reason step by step, and put your final answer within '\\boxed{}', e.g. \\boxed{{A}}."
 math_agent_template: "{observation}\nEnsure that your response includes the format of '\\boxed{{answer}}', e.g. \\boxed{{A}}."
@@ -136,11 +139,12 @@ custom_envs:
     env_type: "roll_math_bandit"
     max_steps: ${max_actions_per_traj}
     max_tokens_per_step: ${max_tokens_per_step}
+    reward_template: ""
     env_manager_cls: ${env_manager_cls}
     agent_system_template: ${math_agent_system_template}
     agent_template: ${math_agent_template}
     env_config:
-      dataset_name: /ibex/user/maw0a/python_project/bandit_reinforce/ROLL/data/dapo_math_17k.jsonl
+      dataset_name: /mnt/project_modelware/zhaojian/weiyu/bandit_reinforce/bandit_reinforce-/ROLL/data/dapo_math_17k.jsonl
       split: train
       question_key: prompt
       answer_key: solution
@@ -151,7 +155,7 @@ bandit_config:
   bandit_algorithm: ts
   # Use local qwen3_embed on server (text-only, SentenceTransformer compatible)
   encoder_type: transformers
-  encoder_model: /ibex/user/maw0a/python_project/models/Qwen3-Embedding-0.6B
+  encoder_model: /mnt/project_modelware/zhaojian/models/pretrain/Qwen3-Embedding-0.6B
   encoder_device: cpu
   embedding_dim: 512
   exploration_param: 1.0
